@@ -102,10 +102,18 @@ func NewSelector(backends BackendStore, policies PolicyStore, breaker *Breaker, 
 // on it. On success the caller must invoke release exactly once when the
 // backend call finishes (releasing is idempotent); the returned Selection
 // carries the backend and the policy applied. Candidates whose circuit is
-// open or whose semaphore is full are skipped in favor of the next one.
-// Errors: ErrNoBackends when the model has no usable backends,
-// ErrNoCapacity when all candidates were skipped, or a wrapped store error.
-func (s *Selector) Select(ctx context.Context, model string) (Selection, func(), error) {
+// open, whose semaphore is full, or whose ID is in exclude are skipped in
+// favor of the next one. exclude lets a caller fail over within one request:
+// pass the IDs of backends already tried so a fresh, untried backend is
+// chosen. Errors: ErrNoBackends when the model has no usable backends at all,
+// ErrNoCapacity when every candidate was skipped (excluded, full, or open),
+// or a wrapped store error.
+func (s *Selector) Select(ctx context.Context, model string, exclude ...uuid.UUID) (Selection, func(), error) {
+	excluded := make(map[uuid.UUID]struct{}, len(exclude))
+	for _, id := range exclude {
+		excluded[id] = struct{}{}
+	}
+
 	policyName, strategy := fallbackPolicyName, fallbackStrategy
 	policy, err := s.policies.GetForModel(ctx, model)
 	switch {
@@ -139,6 +147,9 @@ func (s *Selector) Select(ctx context.Context, model string) (Selection, func(),
 	// admits nothing else); the policy's declared strategy is still surfaced
 	// on the Selection for the response header.
 	for _, b := range s.order(candidates) {
+		if _, skip := excluded[b.ID]; skip {
+			continue
+		}
 		sem := s.semaphoreFor(b)
 		if !sem.tryAcquire() {
 			continue

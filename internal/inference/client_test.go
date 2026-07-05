@@ -391,3 +391,49 @@ func TestIsTransientOnForeignError(t *testing.T) {
 	assert.False(t, IsTransient(errors.New("plain")))
 	assert.False(t, IsTransient(nil))
 }
+
+// capClient builds a Client with a tiny response cap for the size-limit tests.
+func capClient(t *scriptedTransport, maxBytes int64) *Client {
+	return New(Config{
+		HTTPClient:       &http.Client{Transport: t},
+		Timeout:          time.Second,
+		MaxAttempts:      3,
+		BackoffBase:      time.Millisecond,
+		BackoffMax:       2 * time.Millisecond,
+		MaxResponseBytes: maxBytes,
+		Metrics:          metrics.New(),
+		Rand:             rand.New(rand.NewSource(1)),
+		Sleep:            func(context.Context, time.Duration) error { return nil },
+	})
+}
+
+func TestDoRejectsOversizedResponse(t *testing.T) {
+	// Body of 11 bytes against a 10-byte cap: rejected as a permanent error,
+	// not retried (the retry would just overrun again).
+	transport := &scriptedTransport{steps: []step{{status: http.StatusOK, body: "12345678901"}}}
+	c := capClient(transport, 10)
+
+	_, err := c.Do(context.Background(), testBackend(), nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrResponseTooLarge)
+	assert.False(t, IsTransient(err), "an oversized body is permanent, so it is not retried")
+	assert.Equal(t, 1, transport.callCount(), "no retry on an oversized response")
+	transport.assertAllBodiesClosed(t)
+}
+
+func TestDoAcceptsResponseAtExactlyTheCap(t *testing.T) {
+	// Exactly at the cap is fine — only strictly larger is rejected.
+	transport := &scriptedTransport{steps: []step{{status: http.StatusOK, body: "1234567890"}}}
+	c := capClient(transport, 10)
+
+	resp, err := c.Do(context.Background(), testBackend(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, "1234567890", string(resp.Body))
+	transport.assertAllBodiesClosed(t)
+}
+
+func TestNewDefaultsResponseCap(t *testing.T) {
+	c := New(Config{})
+	assert.Equal(t, int64(DefaultMaxResponseBytes), c.maxResponseBytes,
+		"an unset cap falls back to the 10 MiB default, never unbounded")
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -46,9 +47,11 @@ type Pinger interface {
 
 // ChatSelector picks a backend for a model and reserves an in-flight slot on
 // it; the returned release must be called when the backend call finishes.
-// Satisfied by *routing.Selector.
+// exclude carries the IDs of backends already tried in this request so
+// Select can hand back a fresh one for intra-request failover. Satisfied by
+// *routing.Selector.
 type ChatSelector interface {
-	Select(ctx context.Context, model string) (routing.Selection, func(), error)
+	Select(ctx context.Context, model string, exclude ...uuid.UUID) (routing.Selection, func(), error)
 }
 
 // InferenceDoer executes one outbound backend call with retry and timeout.
@@ -68,8 +71,9 @@ type CircuitReporter interface {
 	ReportCanceled(backend string)
 }
 
-// InferenceRequestStore appends inference_requests ledger rows. Satisfied by
-// *db.InferenceRequestRepo.
+// InferenceRequestStore appends inference_requests ledger rows. It is the
+// synchronous store the AsyncLedger drains into (not called from the request
+// hot path). Satisfied by *db.InferenceRequestRepo.
 type InferenceRequestStore interface {
 	Insert(ctx context.Context, row models.InferenceRequest) (models.InferenceRequest, error)
 }
@@ -90,7 +94,12 @@ type Deps struct {
 	Selector      ChatSelector
 	Inference     InferenceDoer
 	Circuit       CircuitReporter
-	Requests      InferenceRequestStore
+	Ledger        LedgerRecorder
+	// InferenceBudget caps the wall-clock time the chat handler spends across
+	// all failover attempts for one request; zero means no extra budget beyond
+	// the request context (used in tests). Production sets it from
+	// config.InferenceBudget().
+	InferenceBudget time.Duration
 }
 
 // NewRouter builds the gateway's HTTP handler: the shared middleware chain

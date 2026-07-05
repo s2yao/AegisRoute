@@ -247,4 +247,24 @@ func TestValidateForServe(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "ADMIN_TOKEN")
 	})
+	t.Run("rejects a retry chain that cannot fit the inference budget", func(t *testing.T) {
+		// 3 attempts × 20s already exceeds the 28s budget before backoff.
+		cfg := validServeConfig()
+		cfg.BackendTimeoutMS = 20000
+		cfg.RetryMaxAttempts = 3
+		err := cfg.ValidateForServe()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "inference budget")
+	})
+	t.Run("accepts a retry chain that fits the budget", func(t *testing.T) {
+		// Defaults: 3×5s + 2×2s = 19s, under the 28s budget.
+		assert.NoError(t, validServeConfig().ValidateForServe())
+	})
+}
+
+func TestInferenceBudget(t *testing.T) {
+	// The handler's total inference budget must sit strictly under the server
+	// write deadline so the response still has time to reach the client.
+	assert.Less(t, (&config.Config{}).InferenceBudget(), config.ServerWriteTimeout)
+	assert.Positive(t, (&config.Config{}).InferenceBudget())
 }

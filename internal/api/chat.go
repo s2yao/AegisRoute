@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/example/aegisroute/internal/auth"
 	"github.com/example/aegisroute/internal/httperror"
 	"github.com/example/aegisroute/internal/inference"
@@ -271,10 +273,12 @@ func (req *ChatRequest) forwardBody() ([]byte, error) {
 	}{req.Model, req.Messages, req.Temperature, req.MaxTokens, req.Stop})
 }
 
-// chatCompletions is POST /v1/chat/completions: validate strictly, route to
-// a backend, call it through the inference client, report the outcome to the
-// circuit breaker, persist the ledger row, and return the backend's
-// OpenAI-compatible JSON with the routing decision in response headers.
+// chatCompletions is POST /v1/chat/completions: validate strictly, then route
+// and call backends — failing over to the next healthy backend on a transient
+// failure — until one succeeds or candidates (or the time budget) run out.
+// Each attempt reports its outcome to the circuit breaker and records an audit
+// row; success returns the backend's OpenAI-compatible JSON with the routing
+// decision in response headers.
 func chatCompletions(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := auth.PrincipalFromContext(r.Context())
@@ -291,10 +295,6 @@ func chatCompletions(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// Build the upstream body before routing: once Select has reserved an
-		// in-flight slot (and possibly the breaker's single half-open probe),
-		// the only permissible next step is the backend call plus its outcome
-		// report — no early return may sit between them.
 		body, err := req.forwardBody()
 		if err != nil {
 			httperror.Write(w, r, http.StatusInternalServerError, httperror.CodeInternal,
@@ -302,65 +302,116 @@ func chatCompletions(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		selection, release, err := deps.Selector.Select(r.Context(), req.Model)
-		if err != nil {
-			writeSelectError(w, r, req.Model, err)
-			return
-		}
-		defer release()
-
-		start := time.Now()
-		resp, err := deps.Inference.Do(r.Context(), selection.Backend, body)
-		latencyMS := int(time.Since(start).Milliseconds())
-
-		if err != nil {
-			// Circuit verdicts: only transient failures count against the
-			// backend; a permanent upstream error (e.g. 400) proves it is
-			// alive. A dead request context outranks both — whatever error
-			// came back, the client's departure is not evidence about the
-			// backend, and a reserved half-open probe must be returned.
-			switch {
-			case r.Context().Err() != nil:
-				deps.Circuit.ReportCanceled(selection.Backend.Name)
-			case inference.IsTransient(err):
-				deps.Circuit.ReportFailure(selection.Backend.Name)
-			default:
-				deps.Circuit.ReportSuccess(selection.Backend.Name)
-			}
-			recordInference(r.Context(), deps, principal, req.Model, selection,
-				models.RequestStatusFailed, latencyMS, body)
-
-			status := http.StatusBadGateway
-			if inference.IsTransient(err) {
-				status = http.StatusServiceUnavailable
-			}
-			httperror.Write(w, r, status, httperror.CodeUpstreamUnavailable,
-				"upstream backend request failed")
-			return
+		// Bound all failover attempts combined, so trying N backends can never
+		// overrun the server's write deadline. Zero budget (tests) leaves the
+		// request context untouched.
+		ctx := r.Context()
+		if deps.InferenceBudget > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, deps.InferenceBudget)
+			defer cancel()
 		}
 
-		deps.Circuit.ReportSuccess(selection.Backend.Name)
-		recordInference(r.Context(), deps, principal, req.Model, selection,
-			models.RequestStatusSucceeded, latencyMS, body)
+		// tried grows with each backend attempted so Select hands back a fresh
+		// one; the loop ends when a backend succeeds, an outcome is terminal,
+		// or Select runs out of untried candidates.
+		var tried []uuid.UUID
+		for {
+			selection, release, selErr := deps.Selector.Select(ctx, req.Model, tried...)
+			if selErr != nil {
+				writeSelectError(w, r, req.Model, selErr, len(tried) > 0)
+				return
+			}
+			tried = append(tried, selection.Backend.ID)
 
-		w.Header().Set(headerBackend, selection.Backend.Name)
-		w.Header().Set(headerRoutingPolicy, selection.PolicyName)
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(resp.Body)
+			resp, doErr, failover := callBackend(ctx, deps, principal, req.Model, body, selection, release)
+			if doErr == nil {
+				w.Header().Set(headerBackend, selection.Backend.Name)
+				w.Header().Set(headerRoutingPolicy, selection.PolicyName)
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(resp.Body)
+				return
+			}
+			// Fail over only on a transient failure that left budget; every
+			// other outcome (permanent error, cancellation, exhausted budget)
+			// is terminal.
+			if failover && ctx.Err() == nil {
+				continue
+			}
+			writeUpstreamError(w, r, doErr)
+			return
+		}
 	}
 }
 
-// writeSelectError maps Selector failures onto the error envelope: an
-// unknown model is the client's mistake (404), exhausted capacity or open
-// circuits are an upstream availability problem (503), anything else is
-// internal.
-func writeSelectError(w http.ResponseWriter, r *http.Request, model string, err error) {
+// callBackend performs one backend attempt and always leaves the shared state
+// consistent: it frees the in-flight slot and releases the circuit breaker's
+// reserved half-open probe even if inference panics (the recover middleware
+// then turns the panic into a 500). It returns the successful response, or the
+// error plus whether the caller should fail over to another backend — true
+// only for a transient failure.
+func callBackend(ctx context.Context, deps Deps, principal auth.Principal,
+	model string, body []byte, selection routing.Selection, release func()) (*inference.Response, error, bool) {
+	backend := selection.Backend.Name
+	defer release() // free the in-flight slot even if Do panics
+
+	// Guarantee a circuit report. On the normal path an explicit report sets
+	// reported=true first, making this a no-op; on a panic before that, it
+	// releases the half-open probe verdict-free so the backend cannot get
+	// stuck un-probeable.
+	reported := false
+	defer func() {
+		if !reported {
+			deps.Circuit.ReportCanceled(backend)
+		}
+	}()
+
+	start := time.Now()
+	resp, err := deps.Inference.Do(ctx, selection.Backend, body)
+	latencyMS := int(time.Since(start).Milliseconds())
+
+	if err == nil {
+		deps.Circuit.ReportSuccess(backend)
+		reported = true
+		recordInference(deps, principal, model, selection, models.RequestStatusSucceeded, latencyMS, body)
+		return resp, nil, false
+	}
+
 	switch {
-	case errors.Is(err, routing.ErrNoBackends):
+	case ctx.Err() != nil:
+		// The operation context ended (client gone or budget exhausted): not a
+		// verdict about the backend, and the request is over — no failover.
+		deps.Circuit.ReportCanceled(backend)
+		reported = true
+		recordInference(deps, principal, model, selection, models.RequestStatusFailed, latencyMS, body)
+		return nil, err, false
+	case inference.IsTransient(err):
+		deps.Circuit.ReportFailure(backend)
+		reported = true
+		recordInference(deps, principal, model, selection, models.RequestStatusFailed, latencyMS, body)
+		return nil, err, true
+	default:
+		// Permanent upstream error (e.g. 400): the backend is alive, so it is a
+		// circuit success, and failing over is pointless — peers serving the
+		// same model reject the same request.
+		deps.Circuit.ReportSuccess(backend)
+		reported = true
+		recordInference(deps, principal, model, selection, models.RequestStatusFailed, latencyMS, body)
+		return nil, err, false
+	}
+}
+
+// writeSelectError maps a Selector failure onto the error envelope. Only a
+// genuinely unknown model (no failover attempted yet) is the client's mistake
+// (404); exhausted capacity, open circuits, or candidates spent by failover
+// are an upstream availability problem (503); a store error is internal (500).
+func writeSelectError(w http.ResponseWriter, r *http.Request, model string, err error, failedOver bool) {
+	switch {
+	case errors.Is(err, routing.ErrNoBackends) && !failedOver:
 		httperror.Write(w, r, http.StatusNotFound, httperror.CodeNotFound,
 			fmt.Sprintf("model %q is not served by any backend", model))
-	case errors.Is(err, routing.ErrNoCapacity):
+	case errors.Is(err, routing.ErrNoBackends), errors.Is(err, routing.ErrNoCapacity):
 		httperror.Write(w, r, http.StatusServiceUnavailable, httperror.CodeUpstreamUnavailable,
 			"no backend is currently available for this model")
 	default:
@@ -369,26 +420,28 @@ func writeSelectError(w http.ResponseWriter, r *http.Request, model string, err 
 	}
 }
 
-// recordInferenceTimeout bounds the ledger insert once it is detached from
-// the request's own lifetime.
-const recordInferenceTimeout = 5 * time.Second
+// writeUpstreamError renders a backend-call failure: a transient failure is a
+// 503 (retry later), anything else a 502.
+func writeUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
+	status := http.StatusBadGateway
+	if inference.IsTransient(err) {
+		status = http.StatusServiceUnavailable
+	}
+	httperror.Write(w, r, status, httperror.CodeUpstreamUnavailable, "upstream backend request failed")
+}
 
-// recordInference appends the inference_requests ledger row. Persistence is
-// best-effort: a ledger write failure is logged but never turns an otherwise
-// served completion into a client-facing error. The insert runs on a context
-// detached from the request's cancellation (request values, like the request
-// id, are kept) — otherwise a client disconnect would erase the audit row
-// for exactly the requests most worth auditing.
-func recordInference(ctx context.Context, deps Deps, principal auth.Principal,
-	model string, selection routing.Selection, status string, latencyMS int, body []byte) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordInferenceTimeout)
-	defer cancel()
+// recordInference hands the inference_requests audit row to the async ledger.
+// Recording is fire-and-forget and off the request hot path: it never blocks
+// the response and a persistence failure never turns a served completion into
+// a client-facing error.
+func recordInference(deps Deps, principal auth.Principal, model string,
+	selection routing.Selection, status string, latencyMS int, body []byte) {
 	if latencyMS < 0 {
 		latencyMS = 0
 	}
 	sum := sha256.Sum256(body)
 	backendID := selection.Backend.ID
-	_, err := deps.Requests.Insert(ctx, models.InferenceRequest{
+	deps.Ledger.Record(models.InferenceRequest{
 		TenantID:    principal.TenantID,
 		APIKeyID:    principal.APIKeyID,
 		Model:       model,
@@ -397,8 +450,4 @@ func recordInference(ctx context.Context, deps Deps, principal auth.Principal,
 		LatencyMS:   latencyMS,
 		RequestHash: hex.EncodeToString(sum[:]),
 	})
-	if err != nil {
-		deps.Logger.Error("failed to persist inference request",
-			"backend", selection.Backend.Name, "status", status, "error", err)
-	}
 }

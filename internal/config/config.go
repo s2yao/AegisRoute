@@ -6,11 +6,25 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // minKeyHashSecretBytes is the floor for APP_KEY_HASH_SECRET: a short HMAC
 // secret weakens every stored API-key hash at once.
 const minKeyHashSecretBytes = 32
+
+// ServerWriteTimeout is the http.Server WriteTimeout the gateway serves
+// under: the whole handler — reading the request, the inference call(s), and
+// writing the response — must finish within it or the socket write fails
+// mid-flight. It lives here (not just in cmd/gateway-api) so ValidateForServe
+// can reject a retry/timeout config that cannot possibly fit, and so the
+// server and the validator can never disagree on the number.
+const ServerWriteTimeout = 30 * time.Second
+
+// inferenceResponseMargin is time reserved within ServerWriteTimeout for
+// everything that is not the upstream call chain (request read, response
+// marshal/write). InferenceBudget is what remains for inference itself.
+const inferenceResponseMargin = 2 * time.Second
 
 // Config holds every environment-derived setting used by the three binaries.
 // The comment on each field names its environment variable.
@@ -152,7 +166,36 @@ func (c *Config) ValidateForServe() error {
 	requirePositive(&errs, "WORKER_MAX_ITEM_ATTEMPTS", c.WorkerMaxItemAttempts)
 	requireNonEmpty(&errs, "STREAM_KEY", c.StreamKey)
 	requireNonEmpty(&errs, "STREAM_GROUP", c.StreamGroup)
+	// A single backend's full retry chain must fit inside the inference budget,
+	// or even one healthy-but-slow backend would blow the server's write
+	// deadline before it could answer. Only checked when the retry inputs are
+	// individually valid, so the message names the relationship, not a value
+	// already flagged above.
+	if c.BackendTimeoutMS >= 1 && c.RetryMaxAttempts >= 1 && c.RetryBaseMS >= 1 && c.RetryMaxMS >= 1 {
+		if worst := c.worstCaseBackendCall(); worst > c.InferenceBudget() {
+			errs = append(errs, fmt.Sprintf(
+				"BACKEND_TIMEOUT_MS×RETRY_MAX_ATTEMPTS plus backoff (worst case %s) must not exceed the inference budget %s (ServerWriteTimeout %s minus %s response margin)",
+				worst, c.InferenceBudget(), ServerWriteTimeout, inferenceResponseMargin))
+		}
+	}
 	return join(errs)
+}
+
+// InferenceBudget is the wall-clock ceiling the chat handler gives the whole
+// inference operation (all failover attempts combined): ServerWriteTimeout
+// minus the response margin, so the reply still has time to reach the client.
+func (c *Config) InferenceBudget() time.Duration {
+	return ServerWriteTimeout - inferenceResponseMargin
+}
+
+// worstCaseBackendCall is the longest a single backend's retry chain can run:
+// one full-timeout attempt per try, plus the capped backoff before each retry.
+// It is the floor the inference budget must clear so at least one backend
+// always gets a complete attempt chain.
+func (c *Config) worstCaseBackendCall() time.Duration {
+	attempts := time.Duration(c.RetryMaxAttempts) * time.Duration(c.BackendTimeoutMS) * time.Millisecond
+	backoff := time.Duration(c.RetryMaxAttempts-1) * time.Duration(c.RetryMaxMS) * time.Millisecond
+	return attempts + backoff
 }
 
 func getString(key, def string) string {

@@ -78,12 +78,37 @@ includes an adversarial-review hardening pass folded in before commit:
   request's cancellation, so disconnects can't erase audit rows;
 - `backoff()` honors a zero base.
 
-This session also added AI-assistant context docs (no source changes):
+A later session added AI-assistant context docs (no source changes):
 `CLAUDE.md` (root), `docs/REPO_MAP.md`, `docs/STAGE_STATUS.md`,
 `internal/db/CLAUDE.md`, `internal/routing/CLAUDE.md`,
 `internal/jobs/CLAUDE.md` (the requested "queue" rules — there is no
 `internal/queue` package; the `Queue` interface is documented to live in
 `internal/jobs`, see that file's naming note).
+
+**Uncommitted Stage-4 polish (this session — NOT committed, per instruction):**
+six gateway-hardening items on top of `c38a2a6`, DoD green under `-race`
+(254 test cases, up from 144). All are documented in DECISIONS.md's Stage-4
+section; suggested commit message: `feat: intra-request failover, async
+ledger, response cap, panic-safe circuit, timeout-budget validation`.
+
+1. **Intra-request failover** — the handler now re-selects (excluding tried
+   backends via `Selector.Select(ctx, model, exclude...)`) and calls the next
+   healthy backend on a transient failure, instead of 503-ing until the
+   circuit trips. Permanent errors/cancellations don't fail over.
+2. **Async ledger** (`internal/api/ledger.go`, `AsyncLedger`) — the
+   inference_requests write moved off the hot path onto a bounded worker pool
+   fed by a buffered queue; wired in `cmd/gateway-api` and closed-before-pool
+   on shutdown. `Deps.Requests` → `Deps.Ledger` (`LedgerRecorder`).
+3. **Response size cap** — `inference.Config.MaxResponseBytes` (default 10 MiB
+   via `io.LimitReader`); oversized reply → permanent error, no OOM.
+4. **Panic-safe circuit report** — `callBackend` defers `release()` and a
+   fallback `ReportCanceled`, so a panic can't strand a half-open probe.
+5. **Timeout-budget validation** — `config.ServerWriteTimeout` (shared by the
+   http.Server and `ValidateForServe`) + `config.InferenceBudget()`; the
+   handler bounds all failover attempts by that budget.
+6. **Permanent e2e wiring test** (`internal/api/e2e_test.go`) — real
+   Selector+Client+Breaker vs httptest backends (happy path, intra-request
+   failover, circuit-opens-and-sheds).
 
 **Branch note:** work lives on `stage4_sync_inference_v2`, cut from
 `stage3_gateway_core` (60fca48). The older `stage4_Sync_inference` branch was

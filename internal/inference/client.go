@@ -92,6 +92,11 @@ type Config struct {
 	// Metrics receives per-attempt backend counters and durations; nil skips
 	// instrumentation.
 	Metrics *metrics.Metrics
+	// MaxResponseBytes caps how many response bytes are read from a backend
+	// before the reply is rejected, so a backend streaming an unbounded (or
+	// maliciously huge) body cannot OOM the gateway. Zero selects
+	// DefaultMaxResponseBytes.
+	MaxResponseBytes int64
 	// Rand drives the jitter draw. Default: a time-seeded source.
 	Rand *rand.Rand
 	// Sleep waits between retries and must return early with the context's
@@ -100,19 +105,29 @@ type Config struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 }
 
+// DefaultMaxResponseBytes bounds a backend reply at 10 MiB when Config leaves
+// MaxResponseBytes unset — comfortably above any real non-streaming
+// completion, low enough to stop an unbounded body from exhausting memory.
+const DefaultMaxResponseBytes = 10 << 20
+
+// ErrResponseTooLarge is the cause wrapped in the permanent Error returned
+// when a backend's reply exceeds MaxResponseBytes.
+var ErrResponseTooLarge = errors.New("inference: backend response exceeds size limit")
+
 // Client executes one outbound inference call against a chosen backend with
 // a per-attempt timeout and bounded retries. It is shared by the completion
 // handler and the batch worker — the two talk to backends through this same
 // type, never through an HTTP hop between our own services. Safe for
 // concurrent use.
 type Client struct {
-	http        *http.Client
-	timeout     time.Duration
-	maxAttempts int
-	backoffBase time.Duration
-	backoffMax  time.Duration
-	metrics     *metrics.Metrics
-	sleep       func(ctx context.Context, d time.Duration) error
+	http             *http.Client
+	timeout          time.Duration
+	maxAttempts      int
+	backoffBase      time.Duration
+	backoffMax       time.Duration
+	maxResponseBytes int64
+	metrics          *metrics.Metrics
+	sleep            func(ctx context.Context, d time.Duration) error
 
 	mu  sync.Mutex // rand.Rand is not thread-safe
 	rng *rand.Rand
@@ -121,20 +136,24 @@ type Client struct {
 // New builds a Client from cfg, filling nil injection points with defaults.
 func New(cfg Config) *Client {
 	c := &Client{
-		http:        cfg.HTTPClient,
-		timeout:     cfg.Timeout,
-		maxAttempts: cfg.MaxAttempts,
-		backoffBase: cfg.BackoffBase,
-		backoffMax:  cfg.BackoffMax,
-		metrics:     cfg.Metrics,
-		rng:         cfg.Rand,
-		sleep:       cfg.Sleep,
+		http:             cfg.HTTPClient,
+		timeout:          cfg.Timeout,
+		maxAttempts:      cfg.MaxAttempts,
+		backoffBase:      cfg.BackoffBase,
+		backoffMax:       cfg.BackoffMax,
+		maxResponseBytes: cfg.MaxResponseBytes,
+		metrics:          cfg.Metrics,
+		rng:              cfg.Rand,
+		sleep:            cfg.Sleep,
 	}
 	if c.http == nil {
 		c.http = &http.Client{}
 	}
 	if c.maxAttempts < 1 {
 		c.maxAttempts = 1
+	}
+	if c.maxResponseBytes <= 0 {
+		c.maxResponseBytes = DefaultMaxResponseBytes
 	}
 	if c.rng == nil {
 		c.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -211,7 +230,9 @@ func (c *Client) attempt(ctx context.Context, backend models.ModelBackend, url s
 		c.observe(backend.Name, outcomeTransientError, start)
 		return nil, &Error{Backend: backend.Name, Transient: true, Err: err}
 	}
-	respBody, readErr := io.ReadAll(resp.Body)
+	// Read at most maxResponseBytes+1: the extra byte lets us detect a body
+	// that overruns the cap without ever buffering the whole thing.
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, c.maxResponseBytes+1))
 	closeErr := resp.Body.Close()
 	if readErr != nil {
 		if ctx.Err() != nil {
@@ -224,6 +245,13 @@ func (c *Client) attempt(ctx context.Context, backend models.ModelBackend, url s
 	if closeErr != nil {
 		c.observe(backend.Name, outcomeTransientError, start)
 		return nil, &Error{Backend: backend.Name, Status: resp.StatusCode, Transient: true, Err: closeErr}
+	}
+	if int64(len(respBody)) > c.maxResponseBytes {
+		// A backend that overruns the cap is misbehaving; treat it as a
+		// permanent fault so we neither retry (risking the same overrun) nor
+		// buffer more of it.
+		c.observe(backend.Name, outcomePermanentError, start)
+		return nil, &Error{Backend: backend.Name, Status: resp.StatusCode, Transient: false, Err: ErrResponseTooLarge}
 	}
 
 	switch {

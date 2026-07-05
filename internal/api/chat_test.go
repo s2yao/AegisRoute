@@ -23,33 +23,51 @@ import (
 
 // --- chat fakes --------------------------------------------------------------
 
-// fakeSelector returns a fixed Selection (or error) and records calls and
-// releases.
+// fakeSelector returns candidates in order, honoring the exclude set so
+// failover picks a fresh backend each call. It records the models requested,
+// the exclude args, and how many times release ran.
 type fakeSelector struct {
-	selection routing.Selection
-	err       error
+	selections []routing.Selection // candidate order
+	err        error
 
 	mu       sync.Mutex
 	calls    []string
+	excludes [][]uuid.UUID
 	released int
 }
 
-func (f *fakeSelector) Select(_ context.Context, model string) (routing.Selection, func(), error) {
+func (f *fakeSelector) Select(_ context.Context, model string, exclude ...uuid.UUID) (routing.Selection, func(), error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, model)
-	f.mu.Unlock()
+	f.excludes = append(f.excludes, append([]uuid.UUID(nil), exclude...))
 	if f.err != nil {
 		return routing.Selection{}, nil, f.err
 	}
-	return f.selection, func() {
-		f.mu.Lock()
-		f.released++
-		f.mu.Unlock()
-	}, nil
+	excluded := map[uuid.UUID]bool{}
+	for _, id := range exclude {
+		excluded[id] = true
+	}
+	for _, sel := range f.selections {
+		if !excluded[sel.Backend.ID] {
+			return sel, func() {
+				f.mu.Lock()
+				f.released++
+				f.mu.Unlock()
+			}, nil
+		}
+	}
+	return routing.Selection{}, nil, routing.ErrNoCapacity
 }
 
-// fakeInference returns a scripted response or error and records the body
-// and backend it was handed.
+func (f *fakeSelector) releaseCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.released
+}
+
+// fakeInference returns a scripted response or error and records the last
+// body and backend it was handed.
 type fakeInference struct {
 	resp *inference.Response
 	err  error
@@ -67,33 +85,57 @@ func (f *fakeInference) Do(_ context.Context, backend models.ModelBackend, body 
 	return f.resp, nil
 }
 
+// inferenceFunc adapts a function to the InferenceDoer interface, for tests
+// that need per-backend behavior (failover) or a panic.
+type inferenceFunc func(context.Context, models.ModelBackend, []byte) (*inference.Response, error)
+
+func (f inferenceFunc) Do(ctx context.Context, b models.ModelBackend, body []byte) (*inference.Response, error) {
+	return f(ctx, b, body)
+}
+
 // fakeCircuit records reported outcomes.
 type fakeCircuit struct {
+	mu        sync.Mutex
 	successes []string
 	failures  []string
 	canceled  []string
 }
 
-func (f *fakeCircuit) ReportSuccess(backend string)  { f.successes = append(f.successes, backend) }
-func (f *fakeCircuit) ReportFailure(backend string)  { f.failures = append(f.failures, backend) }
-func (f *fakeCircuit) ReportCanceled(backend string) { f.canceled = append(f.canceled, backend) }
+func (f *fakeCircuit) ReportSuccess(backend string)  { f.record(&f.successes, backend) }
+func (f *fakeCircuit) ReportFailure(backend string)  { f.record(&f.failures, backend) }
+func (f *fakeCircuit) ReportCanceled(backend string) { f.record(&f.canceled, backend) }
 
-// fakeRequestLog records inserted ledger rows (and the liveness of the
-// context each insert arrived on) and can be primed to fail.
-type fakeRequestLog struct {
-	rows    []models.InferenceRequest
-	ctxErrs []error
-	err     error
+func (f *fakeCircuit) record(dst *[]string, backend string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	*dst = append(*dst, backend)
 }
 
-func (f *fakeRequestLog) Insert(ctx context.Context, row models.InferenceRequest) (models.InferenceRequest, error) {
-	f.ctxErrs = append(f.ctxErrs, ctx.Err())
-	if f.err != nil {
-		return models.InferenceRequest{}, f.err
-	}
-	row.ID = uuid.New()
-	f.rows = append(f.rows, row)
-	return row, nil
+func (f *fakeCircuit) snapshot() (succ, fail, canc []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := func(s []string) []string { return append([]string(nil), s...) }
+	return cp(f.successes), cp(f.failures), cp(f.canceled)
+}
+
+// fakeLedger is a synchronous LedgerRecorder: Record appends immediately so
+// tests can assert right after the request (the real AsyncLedger is exercised
+// in ledger_test.go).
+type fakeLedger struct {
+	mu   sync.Mutex
+	rows []models.InferenceRequest
+}
+
+func (l *fakeLedger) Record(row models.InferenceRequest) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rows = append(l.rows, row)
+}
+
+func (l *fakeLedger) all() []models.InferenceRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]models.InferenceRequest(nil), l.rows...)
 }
 
 // chatFixture bundles the chat fakes wired into a router.
@@ -103,41 +145,49 @@ type chatFixture struct {
 	selector  *fakeSelector
 	inference *fakeInference
 	circuit   *fakeCircuit
-	requests  *fakeRequestLog
+	ledger    *fakeLedger
 	backend   models.ModelBackend
 }
 
 const upstreamJSON = `{"id":"chatcmpl-abc","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}`
 
-func newChatFixture(t *testing.T) *chatFixture {
-	t.Helper()
-	backend := models.ModelBackend{
+// testBackend builds an enabled backend with the given name/priority.
+func testBackend(name string, priority int) models.ModelBackend {
+	return models.ModelBackend{
 		ID:        uuid.New(),
-		Name:      "mock-llm-fast",
-		BaseURL:   "http://mock-llm-fast:8081",
+		Name:      name,
+		BaseURL:   "http://" + name + ":8081",
 		ModelName: "llama-fast",
 		Kind:      models.BackendKindMock,
-		Enabled:   true, Priority: 10, Weight: 1, MaxInFlight: 4,
+		Enabled:   true, Priority: priority, Weight: 1, MaxInFlight: 4,
 	}
+}
+
+func newChatFixture(t *testing.T) *chatFixture {
+	t.Helper()
+	backend := testBackend("mock-llm-fast", 10)
 	f := &chatFixture{
-		selector: &fakeSelector{selection: routing.Selection{
+		selector: &fakeSelector{selections: []routing.Selection{{
 			Backend:    backend,
 			PolicyName: "default",
 			Strategy:   models.StrategyPriorityWeighted,
-		}},
+		}}},
 		inference: &fakeInference{resp: &inference.Response{StatusCode: http.StatusOK, Body: []byte(upstreamJSON)}},
 		circuit:   &fakeCircuit{},
-		requests:  &fakeRequestLog{},
+		ledger:    &fakeLedger{},
 		backend:   backend,
 	}
 	f.deps = testDeps()
 	f.deps.Selector = f.selector
 	f.deps.Inference = f.inference
 	f.deps.Circuit = f.circuit
-	f.deps.Requests = f.requests
+	f.deps.Ledger = f.ledger
 	f.handler = api.NewRouter(f.deps)
 	return f
 }
+
+// rebuild rewires the router after a test overrides a dep on f.deps.
+func (f *chatFixture) rebuild() { f.handler = api.NewRouter(f.deps) }
 
 // postChat sends an authenticated POST /v1/chat/completions with the body.
 func (f *chatFixture) postChat(t *testing.T, body string) *httptest.ResponseRecorder {
@@ -163,9 +213,10 @@ func TestChatCompletionsHappyPath(t *testing.T) {
 	assert.Empty(t, rec.Header().Get("X-AegisRoute-Cache"), "the cache header arrives in Stage 5, not before")
 
 	assert.Equal(t, []string{"llama-fast"}, f.selector.calls)
-	assert.Equal(t, 1, f.selector.released, "the in-flight slot is released exactly once")
-	assert.Equal(t, []string{"mock-llm-fast"}, f.circuit.successes)
-	assert.Empty(t, f.circuit.failures)
+	assert.Equal(t, 1, f.selector.releaseCount(), "the in-flight slot is released exactly once")
+	succ, fail, _ := f.circuit.snapshot()
+	assert.Equal(t, []string{"mock-llm-fast"}, succ)
+	assert.Empty(t, fail)
 	assert.Equal(t, f.backend.ID, f.inference.gotBackend.ID, "the selected backend receives the call")
 }
 
@@ -189,8 +240,9 @@ func TestChatCompletionsPersistsLedgerRow(t *testing.T) {
 	rec := f.postChat(t, validChatBody)
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	require.Len(t, f.requests.rows, 1)
-	row := f.requests.rows[0]
+	rows := f.ledger.all()
+	require.Len(t, rows, 1)
+	row := rows[0]
 	assert.Equal(t, models.RequestStatusSucceeded, row.Status)
 	assert.Equal(t, "llama-fast", row.Model)
 	require.NotNil(t, row.BackendID)
@@ -202,17 +254,11 @@ func TestChatCompletionsPersistsLedgerRow(t *testing.T) {
 	assert.NotEqual(t, uuid.Nil, row.APIKeyID)
 }
 
-func TestChatCompletionsLedgerFailureDoesNotFailRequest(t *testing.T) {
-	f := newChatFixture(t)
-	f.requests.err = errors.New("pg down")
-	rec := f.postChat(t, validChatBody)
-	assert.Equal(t, http.StatusOK, rec.Code,
-		"a ledger write failure must never turn a served completion into an error")
-}
-
 // --- upstream failures -------------------------------------------------------
 
 func TestChatCompletionsTransientUpstreamFailure(t *testing.T) {
+	// Single backend that fails transiently: no failover target exists, so the
+	// selector returns ErrNoCapacity on the retry and the request ends 503.
 	f := newChatFixture(t)
 	f.inference.resp = nil
 	f.inference.err = &inference.Error{Backend: "mock-llm-fast", Status: 503, Transient: true}
@@ -222,13 +268,13 @@ func TestChatCompletionsTransientUpstreamFailure(t *testing.T) {
 	env := decodeError(t, rec.Body)
 	assert.Equal(t, "upstream_unavailable", env.Error.Code)
 
-	assert.Equal(t, []string{"mock-llm-fast"}, f.circuit.failures,
-		"a transient failure counts against the circuit")
-	assert.Empty(t, f.circuit.successes)
-	assert.Equal(t, 1, f.selector.released)
+	_, fail, _ := f.circuit.snapshot()
+	assert.Equal(t, []string{"mock-llm-fast"}, fail, "a transient failure counts against the circuit")
+	assert.Equal(t, 1, f.selector.releaseCount())
 
-	require.Len(t, f.requests.rows, 1)
-	assert.Equal(t, models.RequestStatusFailed, f.requests.rows[0].Status)
+	rows := f.ledger.all()
+	require.Len(t, rows, 1)
+	assert.Equal(t, models.RequestStatusFailed, rows[0].Status)
 }
 
 func TestChatCompletionsPermanentUpstreamFailure(t *testing.T) {
@@ -241,25 +287,27 @@ func TestChatCompletionsPermanentUpstreamFailure(t *testing.T) {
 	env := decodeError(t, rec.Body)
 	assert.Equal(t, "upstream_unavailable", env.Error.Code)
 
-	assert.Empty(t, f.circuit.failures,
-		"a permanent upstream error proves the backend is alive — no circuit failure")
-	assert.Equal(t, []string{"mock-llm-fast"}, f.circuit.successes)
-	require.Len(t, f.requests.rows, 1)
-	assert.Equal(t, models.RequestStatusFailed, f.requests.rows[0].Status)
+	succ, fail, _ := f.circuit.snapshot()
+	assert.Empty(t, fail, "a permanent upstream error proves the backend is alive — no circuit failure")
+	assert.Equal(t, []string{"mock-llm-fast"}, succ)
+	assert.Equal(t, []string{"llama-fast"}, f.selector.calls, "a permanent error never fails over")
+	rows := f.ledger.all()
+	require.Len(t, rows, 1)
+	assert.Equal(t, models.RequestStatusFailed, rows[0].Status)
 }
 
 func TestChatCompletionsClientCancellation(t *testing.T) {
-	// The client disconnects mid-call: the fake inference cancels the request
-	// context and fails. The circuit must get a verdict-free canceled report
-	// (not a failure that could open it), and the audit row must still be
-	// written — on a context detached from the dead request.
+	// The client disconnects mid-call: inference cancels the request context
+	// and fails. The circuit gets a verdict-free canceled report (not a failure
+	// that could open it), no failover is attempted, and the audit row is still
+	// recorded.
 	f := newChatFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	f.deps.Inference = inferenceFunc(func(context.Context, models.ModelBackend, []byte) (*inference.Response, error) {
 		cancel()
 		return nil, &inference.Error{Backend: "mock-llm-fast", Transient: false, Err: context.Canceled}
 	})
-	f.handler = api.NewRouter(f.deps)
+	f.rebuild()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(validChatBody)).
 		WithContext(ctx)
@@ -267,21 +315,101 @@ func TestChatCompletionsClientCancellation(t *testing.T) {
 	rec := do(t, f.handler, req)
 
 	assert.Equal(t, http.StatusBadGateway, rec.Code)
-	assert.Equal(t, []string{"mock-llm-fast"}, f.circuit.canceled)
-	assert.Empty(t, f.circuit.failures, "a client disconnect must never count against the backend")
-	assert.Empty(t, f.circuit.successes)
+	succ, fail, canc := f.circuit.snapshot()
+	assert.Equal(t, []string{"mock-llm-fast"}, canc)
+	assert.Empty(t, fail, "a client disconnect must never count against the backend")
+	assert.Empty(t, succ)
+	assert.Equal(t, []string{"llama-fast"}, f.selector.calls, "cancellation ends the request, no failover")
 
-	require.Len(t, f.requests.rows, 1, "the ledger row survives the disconnect")
-	assert.Equal(t, models.RequestStatusFailed, f.requests.rows[0].Status)
-	require.Len(t, f.requests.ctxErrs, 1)
-	assert.NoError(t, f.requests.ctxErrs[0], "the insert context must be detached from the canceled request")
+	rows := f.ledger.all()
+	require.Len(t, rows, 1, "the ledger row is recorded even when the client left")
+	assert.Equal(t, models.RequestStatusFailed, rows[0].Status)
 }
 
-// inferenceFunc adapts a function to the InferenceDoer interface.
-type inferenceFunc func(context.Context, models.ModelBackend, []byte) (*inference.Response, error)
+// --- intra-request failover (#1) ---------------------------------------------
 
-func (f inferenceFunc) Do(ctx context.Context, b models.ModelBackend, body []byte) (*inference.Response, error) {
-	return f(ctx, b, body)
+func TestChatCompletionsFailsOverOnTransient(t *testing.T) {
+	// Backend A fails transiently, B succeeds: the same request must succeed on
+	// B, reporting a failure for A and a success for B, releasing both slots.
+	fast := testBackend("be-fast", 10)
+	cheap := testBackend("be-cheap", 20)
+	f := newChatFixture(t)
+	f.selector.selections = []routing.Selection{
+		{Backend: fast, PolicyName: "default", Strategy: models.StrategyPriorityWeighted},
+		{Backend: cheap, PolicyName: "default", Strategy: models.StrategyPriorityWeighted},
+	}
+	f.deps.Inference = inferenceFunc(func(_ context.Context, b models.ModelBackend, _ []byte) (*inference.Response, error) {
+		if b.Name == "be-fast" {
+			return nil, &inference.Error{Backend: b.Name, Status: 503, Transient: true}
+		}
+		return &inference.Response{StatusCode: 200, Body: []byte(upstreamJSON)}, nil
+	})
+	f.rebuild()
+
+	rec := f.postChat(t, validChatBody)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, "be-cheap", rec.Header().Get("X-AegisRoute-Backend"), "the response came from the failover backend")
+
+	succ, fail, _ := f.circuit.snapshot()
+	assert.Equal(t, []string{"be-fast"}, fail, "the failing backend is reported failed")
+	assert.Equal(t, []string{"be-cheap"}, succ, "the failover backend is reported succeeded")
+	assert.Equal(t, 2, f.selector.releaseCount(), "both reserved slots are released")
+
+	require.Len(t, f.selector.excludes, 2)
+	assert.Empty(t, f.selector.excludes[0], "first Select excludes nothing")
+	assert.Equal(t, []uuid.UUID{fast.ID}, f.selector.excludes[1], "the retry excludes the failed backend")
+
+	rows := f.ledger.all()
+	require.Len(t, rows, 2, "both attempts are audited")
+	assert.Equal(t, models.RequestStatusFailed, rows[0].Status)
+	assert.Equal(t, models.RequestStatusSucceeded, rows[1].Status)
+}
+
+func TestChatCompletionsFailoverExhausted(t *testing.T) {
+	// Every backend fails transiently: after trying all of them the selector
+	// runs out of fresh candidates and the request ends 503.
+	fast := testBackend("be-fast", 10)
+	cheap := testBackend("be-cheap", 20)
+	f := newChatFixture(t)
+	f.selector.selections = []routing.Selection{
+		{Backend: fast, PolicyName: "default", Strategy: models.StrategyPriorityWeighted},
+		{Backend: cheap, PolicyName: "default", Strategy: models.StrategyPriorityWeighted},
+	}
+	f.deps.Inference = inferenceFunc(func(_ context.Context, b models.ModelBackend, _ []byte) (*inference.Response, error) {
+		return nil, &inference.Error{Backend: b.Name, Status: 503, Transient: true}
+	})
+	f.rebuild()
+
+	rec := f.postChat(t, validChatBody)
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "upstream_unavailable", decodeError(t, rec.Body).Error.Code)
+
+	_, fail, _ := f.circuit.snapshot()
+	assert.ElementsMatch(t, []string{"be-fast", "be-cheap"}, fail, "both backends were tried and reported failed")
+	assert.Equal(t, 2, f.selector.releaseCount(), "every reserved slot is released")
+	assert.Len(t, f.ledger.all(), 2)
+}
+
+// --- probe/slot cleanup on panic (#4) ----------------------------------------
+
+func TestChatCompletionsInferencePanicCleansUp(t *testing.T) {
+	// If the inference call panics, the recover middleware returns 500, but the
+	// reserved in-flight slot and the circuit's half-open probe must still be
+	// released so the backend can't get stuck.
+	f := newChatFixture(t)
+	f.deps.Inference = inferenceFunc(func(context.Context, models.ModelBackend, []byte) (*inference.Response, error) {
+		panic("backend client blew up")
+	})
+	f.rebuild()
+
+	rec := f.postChat(t, validChatBody)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Equal(t, "internal", decodeError(t, rec.Body).Error.Code)
+
+	assert.Equal(t, 1, f.selector.releaseCount(), "the in-flight slot is freed even on panic")
+	_, _, canc := f.circuit.snapshot()
+	assert.Equal(t, []string{"mock-llm-fast"}, canc,
+		"the half-open probe is released verdict-free on panic, not left reserved")
 }
 
 // --- routing failures --------------------------------------------------------
@@ -305,7 +433,7 @@ func TestChatCompletionsRoutingErrors(t *testing.T) {
 			assert.Equal(t, tc.wantStatus, rec.Code)
 			env := decodeError(t, rec.Body)
 			assert.Equal(t, tc.wantCode, env.Error.Code)
-			assert.Empty(t, f.requests.rows, "no ledger row before a backend was chosen")
+			assert.Empty(t, f.ledger.all(), "no ledger row before a backend was chosen")
 		})
 	}
 }
@@ -379,7 +507,7 @@ func TestChatCompletionsValidation(t *testing.T) {
 			assert.Equal(t, tc.wantCode, env.Error.Code)
 			assert.NotEmpty(t, env.Error.RequestID)
 			assert.Empty(t, f.selector.calls, "invalid requests must never reach routing")
-			assert.Empty(t, f.requests.rows)
+			assert.Empty(t, f.ledger.all())
 		})
 	}
 }

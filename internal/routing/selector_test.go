@@ -152,6 +152,47 @@ func TestSelectPrefersLowerPriority(t *testing.T) {
 	}
 }
 
+func TestSelectExcludesTriedBackends(t *testing.T) {
+	primary := be("primary", 10, 1, 8)
+	secondary := be("secondary", 20, 1, 8)
+	s := newTestSelector([]models.ModelBackend{primary, secondary}, notFoundPolicies, 1)
+	ctx := context.Background()
+
+	// No exclusion: the preferred (lower-priority) backend is chosen.
+	sel1, release1, err := s.Select(ctx, "llama-fast")
+	require.NoError(t, err)
+	assert.Equal(t, "primary", sel1.Backend.Name)
+	release1()
+
+	// Excluding the primary hands back the untried secondary — the mechanism
+	// the handler uses to fail over within one request.
+	sel2, release2, err := s.Select(ctx, "llama-fast", primary.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "secondary", sel2.Backend.Name)
+	release2()
+
+	// Excluding every backend for the model leaves no fresh candidate.
+	_, _, err = s.Select(ctx, "llama-fast", primary.ID, secondary.ID)
+	assert.ErrorIs(t, err, ErrNoCapacity,
+		"once every candidate is excluded, failover is exhausted")
+}
+
+func TestSelectExcludeFreesSlotOfSkippedBackend(t *testing.T) {
+	// A backend skipped by exclusion must not have its semaphore consumed, or
+	// failover would leak capacity on the very backends it skips.
+	primary := be("primary", 10, 1, 1)
+	secondary := be("secondary", 20, 1, 1)
+	s := newTestSelector([]models.ModelBackend{primary, secondary}, notFoundPolicies, 1)
+	ctx := context.Background()
+
+	sel, release, err := s.Select(ctx, "llama-fast", primary.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "secondary", sel.Backend.Name)
+	assert.Equal(t, 0, s.InFlight(primary.ID), "an excluded backend's slot is never taken")
+	assert.Equal(t, 1, s.InFlight(secondary.ID))
+	release()
+}
+
 func TestSelectSkipsOpenCircuit(t *testing.T) {
 	primary := be("primary", 10, 1, 8)
 	secondary := be("secondary", 20, 1, 8)

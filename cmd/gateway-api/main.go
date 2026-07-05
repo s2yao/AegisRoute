@@ -170,24 +170,39 @@ func runServe(ctx context.Context) error {
 		Metrics:     m,
 	})
 
+	// The audit ledger writes on background workers so a slow Postgres never
+	// adds latency to a completion. Closed before the pool (deferred later, so
+	// LIFO runs it first) to flush queued rows while the pool is still open.
+	ledger := api.NewAsyncLedger(db.NewInferenceRequestRepo(pool), logger, ledgerWorkers, ledgerBuffer)
+	defer ledger.Close()
+
 	handler := api.NewRouter(api.Deps{
-		Logger:        logger,
-		Metrics:       m,
-		KeyHashSecret: cfg.AppKeyHashSecret,
-		AdminToken:    cfg.AdminToken,
-		Keys:          db.NewAPIKeyRepo(pool),
-		Backends:      backendRepo,
-		Policies:      policyRepo,
-		DBPinger:      pgPinger{pool: pool},
-		RedisPinger:   redisPinger{client: rdb},
-		Selector:      selector,
-		Inference:     inferenceClient,
-		Circuit:       breaker,
-		Requests:      db.NewInferenceRequestRepo(pool),
+		Logger:          logger,
+		Metrics:         m,
+		KeyHashSecret:   cfg.AppKeyHashSecret,
+		AdminToken:      cfg.AdminToken,
+		Keys:            db.NewAPIKeyRepo(pool),
+		Backends:        backendRepo,
+		Policies:        policyRepo,
+		DBPinger:        pgPinger{pool: pool},
+		RedisPinger:     redisPinger{client: rdb},
+		Selector:        selector,
+		Inference:       inferenceClient,
+		Circuit:         breaker,
+		Ledger:          ledger,
+		InferenceBudget: cfg.InferenceBudget(),
 	})
 
 	return serve(ctx, logger, cfg.AppPort, handler)
 }
+
+// Async-ledger pool sizing: enough workers to keep up with normal completion
+// rates, a queue deep enough to ride out a brief Postgres stall before rows
+// start being dropped (best-effort).
+const (
+	ledgerWorkers = 4
+	ledgerBuffer  = 2048
+)
 
 // serve runs the HTTP server until SIGINT/SIGTERM, then drains in-flight
 // requests within shutdownTimeout.
@@ -197,8 +212,10 @@ func serve(ctx context.Context, logger *slog.Logger, port int, handler http.Hand
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Shared with config.ValidateForServe so the retry/timeout budget check
+		// and the actual socket deadline can never disagree.
+		WriteTimeout: config.ServerWriteTimeout,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
