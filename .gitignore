@@ -1,0 +1,38 @@
+# Local environment files (secrets) — .env.example stays tracked
+.env
+.env.*
+!.env.example
+
+# Go build & test artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+coverage.*
+*.cover
+
+# Local logs / temp
+*.log
+tmp/
+*.tmp
+
+# IDE / editor metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local docker compose overrides
+docker-compose.override.yml
+compose.override.yml
+compose.override.yaml
