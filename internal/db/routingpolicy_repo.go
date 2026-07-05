@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -32,6 +33,36 @@ func (r *RoutingPolicyRepo) Insert(ctx context.Context, p models.RoutingPolicy) 
 		VALUES ($1, $2, $3, COALESCE($4, '{}'::jsonb), $5)
 		RETURNING id, name, model_name, strategy, config, enabled, created_at, updated_at`,
 		p.Name, p.ModelName, p.Strategy, normalizeJSONB(p.Config), p.Enabled)
+	return scanRoutingPolicy(row)
+}
+
+// Upsert inserts a policy by name or, when the name already exists, rewrites
+// its mutable columns to match p and returns the stored row. Config gets the
+// same contentless-to-'{}' normalization as Insert. It converges the row to
+// the supplied desired state so the idempotent Stage-3 seeder can re-run
+// safely.
+func (r *RoutingPolicyRepo) Upsert(ctx context.Context, p models.RoutingPolicy) (models.RoutingPolicy, error) {
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO routing_policies (name, model_name, strategy, config, enabled)
+		VALUES ($1, $2, $3, COALESCE($4, '{}'::jsonb), $5)
+		ON CONFLICT (name) DO UPDATE SET
+			model_name = EXCLUDED.model_name,
+			strategy = EXCLUDED.strategy,
+			config = EXCLUDED.config,
+			enabled = EXCLUDED.enabled
+		RETURNING id, name, model_name, strategy, config, enabled, created_at, updated_at`,
+		p.Name, p.ModelName, p.Strategy, normalizeJSONB(p.Config), p.Enabled)
+	return scanRoutingPolicy(row)
+}
+
+// GetByID returns the policy with the given id, or ErrNotFound. Used by the
+// admin PATCH handler to load a policy before applying its mutable fields.
+func (r *RoutingPolicyRepo) GetByID(ctx context.Context, id uuid.UUID) (models.RoutingPolicy, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT id, name, model_name, strategy, config, enabled, created_at, updated_at
+		FROM routing_policies
+		WHERE id = $1`,
+		id)
 	return scanRoutingPolicy(row)
 }
 

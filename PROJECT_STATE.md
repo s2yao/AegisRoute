@@ -53,9 +53,9 @@ flowchart LR
 ## The 7 stages
 
 1. **Foundations** (config, errors, logging, metrics scaffold) — ✅ **DONE** (`make verify` green)
-2. Data layer (migrations, db, redisstore, models, repos) ← **NEXT**
-3. Gateway core (server, middleware, auth, health/ready, seed, /v1/models)
-4. Sync inference (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions)
+2. **Data layer** (migrations, db, redisstore, models, repos) — ✅ **DONE**
+3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
+4. Sync inference (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) ← **NEXT**
 5. Cache + idempotency + rate limiting
 6. Batch jobs + Redis Streams + control-worker
 7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification
@@ -64,8 +64,8 @@ flowchart LR
 
 | Bucket | Contents |
 | --- | --- |
-| **Current stage (build now)** | Stage 1 — COMPLETE. Next session builds Stage 2 only: migrations, db, redisstore, models, repos. |
-| **Future milestones (roadmap only)** | Stages 3–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
+| **Current stage (build now)** | Stages 1–3 COMPLETE. Next session builds Stage 4 only: cmd/mock-llm, internal/inference client (timeout/retry/max_in_flight), circuit breaker, internal/routing selection, /v1/chat/completions. |
+| **Future milestones (roadmap only)** | Stages 5–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
 | **Context only (never a build order)** | Architecture diagram, locked stack, ports table, demo credentials, Docker/compose notes, resume-positioning language. |
 | **Non-goals (entire MVP; mention only in docs/future-work.md)** | k6, Grafana dashboards, Kubernetes, Terraform, real model providers, OIDC, RBAC, SSE/streaming, gRPC, sqlc, global/distributed concurrency control. |
 

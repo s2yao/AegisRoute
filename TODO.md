@@ -19,24 +19,27 @@ starts.
 - [x] Definition of Done: gofmt clean, go vet, go build, go test, make verify, make help
 - [x] Update memory files; commit in two commits (tracking, then foundation)
 
-## Stage 2 — Data layer (NEXT)
+## Stage 2 — Data layer (DONE)
 
-- [ ] goose migrations (embedded via //go:embed), schema only
-- [ ] internal/db: pgx repositories (raw SQL); consumer-declared repo interfaces
-- [ ] internal/redisstore: Redis client construction/helpers
-- [ ] internal/models: shared domain types
-- [ ] -migrate mode wired in gateway-api; make migrate-up / test-integration real
-- [ ] //go:build integration tests against real PG/Redis
+- [x] goose migrations (embedded via //go:embed), schema only
+- [x] internal/db: pgx repositories (raw SQL); consumer-declared repo interfaces
+- [x] internal/redisstore: Redis client construction/helpers
+- [x] internal/models: shared domain types
+- [x] -migrate mode wired in gateway-api; make migrate-up / test-integration real
+- [x] //go:build integration tests against real PG/Redis
 
-## Stage 3 — Gateway core
+## Stage 3 — Gateway core (DONE)
 
-- [ ] cmd/gateway-api HTTP server (chi), graceful shutdown
-- [ ] Middleware: request-id, logging (redacted), metrics, recovery
-- [ ] Auth: bearer API keys (HMAC-SHA256 lookup), admin token; fixed routing table; 400 on credentials in query params
-- [ ] /healthz, /readyz, /metrics; /v1/models
-- [ ] internal/seed idempotent seeder; -seed mode; AEGISROUTE_AUTO_MIGRATE/AUTO_SEED startup paths; make seed-dev real
+- [x] cmd/gateway-api HTTP server (chi), graceful shutdown (signal.NotifyContext + srv.Shutdown)
+- [x] Middleware chain: recover→request-id→logging (redacted)→metrics→reject-query-credentials, then route-scoped auth
+- [x] Auth: bearer API keys (HMAC-SHA256 lookup, internal/auth), admin token (X-Admin-Token, ConstantTimeCompare); fixed routing table; 400 on credentials in query params
+- [x] /healthz, /readyz (Pinger interface), /metrics; /v1/models (bearer, dedup by model_name)
+- [x] Admin control-plane CRUD: /api/v1/backends{,/{id}}, /api/v1/routing-policies{,/{id}} (soft-disable, immutable-field protection)
+- [x] internal/seed idempotent seeder; -seed mode; AEGISROUTE_AUTO_MIGRATE/AUTO_SEED startup paths; make seed-dev real
+- [x] db additions: APIKeyRepo.GetByHash→*APIKey, BackendRepo.List+Upsert, RoutingPolicyRepo.GetByID+Upsert, IsUniqueViolation
+- [x] Tests (Docker-free, fakes): auth, middleware, health, /v1/models, admin CRUD, seed, error-shape
 
-## Stage 4 — Sync inference
+## Stage 4 — Sync inference (NEXT)
 
 - [ ] cmd/mock-llm deterministic OpenAI-compatible backend
 - [ ] internal/inference upstream client: timeout, retry (RETRY_* env), per-backend max_in_flight semaphore

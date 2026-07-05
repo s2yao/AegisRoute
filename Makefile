@@ -40,7 +40,7 @@ migrate-up: ## Apply embedded DB migrations to DATABASE_URL
 	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/gateway-api -migrate
 
 seed-dev: ## Seed demo tenant, API key, and backends
-	@echo "not implemented until Stage 3"; exit 1
+	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/gateway-api -seed
 
 dev-up: ## Start the full local stack via docker compose
 	@echo "not implemented until Stage 7"; exit 1

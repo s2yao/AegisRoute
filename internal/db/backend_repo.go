@@ -32,6 +32,28 @@ func (r *BackendRepo) Insert(ctx context.Context, b models.ModelBackend) (models
 	return scanBackend(row)
 }
 
+// Upsert inserts a backend by name or, when the name already exists, rewrites
+// its mutable columns to match b and returns the stored row. It converges the
+// row to the supplied desired state, which is exactly what the idempotent
+// Stage-3 seeder relies on: re-running seed always leaves the demo backends in
+// their declared configuration.
+func (r *BackendRepo) Upsert(ctx context.Context, b models.ModelBackend) (models.ModelBackend, error) {
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO model_backends (name, base_url, model_name, kind, enabled, priority, weight, max_in_flight)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (name) DO UPDATE SET
+			base_url = EXCLUDED.base_url,
+			model_name = EXCLUDED.model_name,
+			kind = EXCLUDED.kind,
+			enabled = EXCLUDED.enabled,
+			priority = EXCLUDED.priority,
+			weight = EXCLUDED.weight,
+			max_in_flight = EXCLUDED.max_in_flight
+		RETURNING id, name, base_url, model_name, kind, enabled, priority, weight, max_in_flight, created_at, updated_at`,
+		b.Name, b.BaseURL, b.ModelName, string(b.Kind), b.Enabled, b.Priority, b.Weight, b.MaxInFlight)
+	return scanBackend(row)
+}
+
 // Update rewrites the mutable columns of the backend identified by b.ID and
 // returns the full stored row, or ErrNotFound when no such backend exists.
 func (r *BackendRepo) Update(ctx context.Context, b models.ModelBackend) (models.ModelBackend, error) {
@@ -52,6 +74,16 @@ func (r *BackendRepo) GetByID(ctx context.Context, id uuid.UUID) (models.ModelBa
 		WHERE id = $1`,
 		id)
 	return scanBackend(row)
+}
+
+// List returns every backend, enabled or not, ordered by (priority, name) so
+// admin listings are stable. Unlike ListEnabled it includes soft-disabled
+// rows, which is what the control-plane admin API must show.
+func (r *BackendRepo) List(ctx context.Context) ([]models.ModelBackend, error) {
+	return r.list(ctx, `
+		SELECT id, name, base_url, model_name, kind, enabled, priority, weight, max_in_flight, created_at, updated_at
+		FROM model_backends
+		ORDER BY priority ASC, name ASC`)
 }
 
 // ListEnabled returns every enabled backend. Ordering by (priority, name) is

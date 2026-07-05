@@ -35,14 +35,21 @@ func (r *APIKeyRepo) Upsert(ctx context.Context, tenantID uuid.UUID, name, keyHa
 }
 
 // GetByHash resolves a presented key's hash to its row, or ErrNotFound. This
-// is the auth hot path: one indexed lookup on the UNIQUE key_hash column.
-func (r *APIKeyRepo) GetByHash(ctx context.Context, keyHash string) (models.APIKey, error) {
+// is the auth hot path: one indexed lookup on the UNIQUE key_hash column. It
+// returns a pointer so the auth middleware can treat a nil *APIKey with an
+// ErrNotFound as "unknown key" (401) and a non-nil error as an infrastructure
+// failure (500), without conflating the two.
+func (r *APIKeyRepo) GetByHash(ctx context.Context, keyHash string) (*models.APIKey, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, name, key_hash, created_at, updated_at
 		FROM api_keys
 		WHERE key_hash = $1`,
 		keyHash)
-	return scanAPIKey(row)
+	k, err := scanAPIKey(row)
+	if err != nil {
+		return nil, err
+	}
+	return &k, nil
 }
 
 // scanAPIKey reads one api_keys row in the column order every query in this

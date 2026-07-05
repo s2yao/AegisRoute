@@ -72,6 +72,16 @@ substitutes. Each entry: the decision, then a one-sentence rationale.
 
 - **The `route` label is always the chi route pattern, never the raw path** — bounded label cardinality. HTTP response headers keep conventional `X-Capitalized` form; only metric names are lowercased.
 
+## Gateway core (Stage 3)
+
+- **Middleware chain order is fixed: recover → request-id → redacted logging → metrics → reject-query-credentials, then route-scoped auth** — recover is outermost so it catches panics in every other middleware; auth is applied per route group (chi `r.Group`) so it always runs after the shared chain. The Stage-3 log line carries exactly method, route pattern, status, duration, request_id — no bodies, no headers, no IDs.
+- **The admin token is presented in the `X-Admin-Token` header, compared with `crypto/subtle.ConstantTimeCompare`; an empty configured token authorizes nobody** — a header (never a query param) keeps the token out of logs/proxies/history, and the empty-token guard defeats `ConstantTimeCompare("","")==1`.
+- **`auth.KeyStore.GetByHash` returns `(*models.APIKey, error)` and `db.APIKeyRepo` was changed to match** — a nil key with `db.ErrNotFound` means "unknown key → 401" while any other error means "infra failure → 500", so a database outage never looks like an auth failure. BearerAuth imports `db` only for the `ErrNotFound` sentinel (acyclic; db never imports auth).
+- **API consumer-declared interfaces live in `internal/api` (`BackendStore`, `PolicyStore`, `Pinger`) and readiness pings go through the tiny `Pinger` interface** — handlers and `/readyz` are unit-tested with in-memory fakes and no live Postgres/Redis; `cmd/gateway-api` adapts `db.Ping`/`redisstore.Ping` into `Pinger`.
+- **Admin CRUD uses pointer-field request DTOs; PATCH DTOs omit immutable columns entirely** — pointers distinguish "omitted" from "zero", so create enforces required fields and patch touches only sent fields; a backend's `name`/`model_name`/`kind` and a policy's `name`/`model_name`/`strategy` cannot be rewritten because they are absent from the patch shape. Disable is always soft (`enabled=false`), never a hard delete.
+- **Seeding converges the database to the declared demo state via `ON CONFLICT (name) DO UPDATE`** (`BackendRepo.Upsert`, `RoutingPolicyRepo.Upsert`) — re-running `-seed` (or `AEGISROUTE_AUTO_SEED` on boot) is always safe and always leaves the local stack in a known-good config; backend base URLs come from `SEED_BACKEND_*` config, never hardcoded, so host (localhost) and compose (service name) runs share one seed path.
+- **`db.IsUniqueViolation` maps Postgres SQLSTATE 23505 to a 409 Conflict** on duplicate-name admin creates, reusing the `conflict` error code instead of surfacing a generic 500.
+
 ## Docker / compose (applies from Stage 7; integration checkpoints earlier)
 
 - **`docker compose` (v2, with a space), never `docker-compose`.**
