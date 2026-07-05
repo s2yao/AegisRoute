@@ -253,4 +253,66 @@ func TestIntegration(t *testing.T) {
 		})
 		assert.ErrorIs(t, err, ErrNotFound, "Update on a missing id must report ErrNotFound")
 	})
+
+	t.Run("InferenceRequestRepo", func(t *testing.T) {
+		tenant, err := NewTenantRepo(pool).Upsert(ctx, "acme-ledger")
+		require.NoError(t, err)
+		key, err := NewAPIKeyRepo(pool).Upsert(ctx, tenant.ID, "ledger-key", "hash-ledger")
+		require.NoError(t, err)
+		backend, err := NewBackendRepo(pool).Insert(ctx, models.ModelBackend{
+			Name:        "ledger-backend",
+			BaseURL:     "http://ledger-backend:8081",
+			ModelName:   "llama-fast",
+			Kind:        models.BackendKindMock,
+			Enabled:     true,
+			Priority:    1,
+			Weight:      1,
+			MaxInFlight: 4,
+		})
+		require.NoError(t, err)
+
+		repo := NewInferenceRequestRepo(pool)
+
+		row, err := repo.Insert(ctx, models.InferenceRequest{
+			TenantID:    tenant.ID,
+			APIKeyID:    key.ID,
+			Model:       "llama-fast",
+			BackendID:   &backend.ID,
+			Status:      models.RequestStatusSucceeded,
+			LatencyMS:   42,
+			RequestHash: "deadbeef",
+		})
+		require.NoError(t, err)
+		assert.NotEqual(t, uuid.Nil, row.ID)
+		assert.Equal(t, tenant.ID, row.TenantID)
+		assert.Equal(t, key.ID, row.APIKeyID)
+		require.NotNil(t, row.BackendID)
+		assert.Equal(t, backend.ID, *row.BackendID)
+		assert.Nil(t, row.CacheResult, "no cache result before Stage 5")
+		assert.Equal(t, models.RequestStatusSucceeded, row.Status)
+		assert.Equal(t, 42, row.LatencyMS)
+		assert.False(t, row.CreatedAt.IsZero())
+
+		// BackendID is nullable: a request can fail before routing chose one.
+		failed, err := repo.Insert(ctx, models.InferenceRequest{
+			TenantID:    tenant.ID,
+			APIKeyID:    key.ID,
+			Model:       "llama-fast",
+			Status:      models.RequestStatusFailed,
+			LatencyMS:   0,
+			RequestHash: "cafef00d",
+		})
+		require.NoError(t, err)
+		assert.Nil(t, failed.BackendID)
+
+		_, err = repo.Insert(ctx, models.InferenceRequest{
+			TenantID:    tenant.ID,
+			APIKeyID:    key.ID,
+			Model:       "llama-fast",
+			Status:      "exploded",
+			LatencyMS:   1,
+			RequestHash: "bad",
+		})
+		assert.Error(t, err, "the status CHECK constraint rejects unknown values")
+	})
 }

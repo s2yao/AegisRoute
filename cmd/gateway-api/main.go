@@ -23,9 +23,12 @@ import (
 	"github.com/example/aegisroute/internal/api"
 	"github.com/example/aegisroute/internal/config"
 	"github.com/example/aegisroute/internal/db"
+	"github.com/example/aegisroute/internal/inference"
 	"github.com/example/aegisroute/internal/metrics"
+	"github.com/example/aegisroute/internal/models"
 	"github.com/example/aegisroute/internal/observability"
 	"github.com/example/aegisroute/internal/redisstore"
+	"github.com/example/aegisroute/internal/routing"
 	"github.com/example/aegisroute/internal/seed"
 )
 
@@ -145,16 +148,42 @@ func runServe(ctx context.Context) error {
 		logger.Info("auto-seed complete")
 	}
 
+	backendRepo := db.NewBackendRepo(pool)
+	policyRepo := db.NewRoutingPolicyRepo(pool)
+
+	// One breaker instance serves both the Selector (skip open circuits) and
+	// the chat handler (report outcomes); its transitions drive the
+	// aegisroute_circuit_breaker_state gauge.
+	breaker := routing.NewBreaker(
+		cfg.CBFailureThreshold,
+		time.Duration(cfg.CBCooldownMS)*time.Millisecond,
+		routing.WithStateListener(func(backend string, state models.CircuitState) {
+			m.CircuitBreakerState.WithLabelValues(backend).Set(routing.CircuitStateGaugeValue(state))
+		}),
+	)
+	selector := routing.NewSelector(backendRepo, policyRepo, breaker)
+	inferenceClient := inference.New(inference.Config{
+		Timeout:     time.Duration(cfg.BackendTimeoutMS) * time.Millisecond,
+		MaxAttempts: cfg.RetryMaxAttempts,
+		BackoffBase: time.Duration(cfg.RetryBaseMS) * time.Millisecond,
+		BackoffMax:  time.Duration(cfg.RetryMaxMS) * time.Millisecond,
+		Metrics:     m,
+	})
+
 	handler := api.NewRouter(api.Deps{
 		Logger:        logger,
 		Metrics:       m,
 		KeyHashSecret: cfg.AppKeyHashSecret,
 		AdminToken:    cfg.AdminToken,
 		Keys:          db.NewAPIKeyRepo(pool),
-		Backends:      db.NewBackendRepo(pool),
-		Policies:      db.NewRoutingPolicyRepo(pool),
+		Backends:      backendRepo,
+		Policies:      policyRepo,
 		DBPinger:      pgPinger{pool: pool},
 		RedisPinger:   redisPinger{client: rdb},
+		Selector:      selector,
+		Inference:     inferenceClient,
+		Circuit:       breaker,
+		Requests:      db.NewInferenceRequestRepo(pool),
 	})
 
 	return serve(ctx, logger, cfg.AppPort, handler)

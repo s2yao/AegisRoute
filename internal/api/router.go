@@ -10,8 +10,10 @@ import (
 
 	"github.com/example/aegisroute/internal/auth"
 	"github.com/example/aegisroute/internal/httperror"
+	"github.com/example/aegisroute/internal/inference"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
+	"github.com/example/aegisroute/internal/routing"
 )
 
 // BackendStore is the subset of the backend repository the API depends on.
@@ -42,6 +44,36 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
+// ChatSelector picks a backend for a model and reserves an in-flight slot on
+// it; the returned release must be called when the backend call finishes.
+// Satisfied by *routing.Selector.
+type ChatSelector interface {
+	Select(ctx context.Context, model string) (routing.Selection, func(), error)
+}
+
+// InferenceDoer executes one outbound backend call with retry and timeout.
+// Satisfied by *inference.Client.
+type InferenceDoer interface {
+	Do(ctx context.Context, backend models.ModelBackend, body []byte) (*inference.Response, error)
+}
+
+// CircuitReporter receives per-backend call outcomes. It must be the same
+// breaker instance the ChatSelector consults, or selection and outcome
+// reporting drift apart. ReportCanceled marks a call ended by the caller's
+// own context — verdict-free, but it returns a reserved half-open probe.
+// Satisfied by *routing.Breaker.
+type CircuitReporter interface {
+	ReportSuccess(backend string)
+	ReportFailure(backend string)
+	ReportCanceled(backend string)
+}
+
+// InferenceRequestStore appends inference_requests ledger rows. Satisfied by
+// *db.InferenceRequestRepo.
+type InferenceRequestStore interface {
+	Insert(ctx context.Context, row models.InferenceRequest) (models.InferenceRequest, error)
+}
+
 // Deps is everything NewRouter needs to wire the gateway. The composition root
 // (cmd/gateway-api) fills it from real repositories, pingers, and config; tests
 // fill it with fakes.
@@ -55,6 +87,10 @@ type Deps struct {
 	Policies      PolicyStore
 	DBPinger      Pinger
 	RedisPinger   Pinger
+	Selector      ChatSelector
+	Inference     InferenceDoer
+	Circuit       CircuitReporter
+	Requests      InferenceRequestStore
 }
 
 // NewRouter builds the gateway's HTTP handler: the shared middleware chain
@@ -84,11 +120,11 @@ func NewRouter(deps Deps) http.Handler {
 	r.Get("/readyz", readyz(deps))
 	r.Handle("/metrics", deps.Metrics.Handler())
 
-	// Bearer-authenticated tenant routes. Only /v1/models today; Stage 4 adds
-	// /v1/chat/completions to this same group.
+	// Bearer-authenticated tenant routes.
 	r.Group(func(br chi.Router) {
 		br.Use(auth.BearerAuth(deps.KeyHashSecret, deps.Keys))
 		br.Get("/v1/models", listModels(deps))
+		br.Post("/v1/chat/completions", chatCompletions(deps))
 	})
 
 	// Admin-token control plane. Scoped to exactly the backend and

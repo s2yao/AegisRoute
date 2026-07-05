@@ -39,15 +39,18 @@ starts.
 - [x] db additions: APIKeyRepo.GetByHash→*APIKey, BackendRepo.List+Upsert, RoutingPolicyRepo.GetByID+Upsert, IsUniqueViolation
 - [x] Tests (Docker-free, fakes): auth, middleware, health, /v1/models, admin CRUD, seed, error-shape
 
-## Stage 4 — Sync inference (NEXT)
+## Stage 4 — Sync inference (DONE — uncommitted; see PROJECT_STATE.md)
 
-- [ ] cmd/mock-llm deterministic OpenAI-compatible backend
-- [ ] internal/inference upstream client: timeout, retry (RETRY_* env), per-backend max_in_flight semaphore
-- [ ] Circuit breaker (CB_* env) as pure state machine
-- [ ] internal/routing backend selection by priority/health
-- [ ] /v1/chat/completions (non-streaming; streaming requests get unsupported_streaming)
+- [x] cmd/mock-llm deterministic OpenAI-compatible backend (hash-derived content, fixed `created`, MOCK_* env incl. latency/jitter/failure-rate, /healthz; httptest-covered)
+- [x] internal/inference Client.Do: per-attempt BACKEND_TIMEOUT_MS, retry RETRY_MAX_ATTEMPTS with exp backoff + full jitter (RETRY_BASE_MS/RETRY_MAX_MS), transient-only retry (timeout/conn/502/503/504), typed Error{Transient}, bodies always closed, per-attempt backend metrics
+- [x] Circuit breaker (internal/routing/circuit.go): closed/open/half-open per backend, CB_FAILURE_THRESHOLD/CB_COOLDOWN_MS, single half-open probe, state listener → aegisroute_circuit_breaker_state gauge (0/1/2); full transition-table tests
+- [x] internal/routing Selector.Select → (Selection{Backend,PolicyName,Strategy}, release, err): enabled policy or in-memory `default` fallback, defensive row filter, skips open circuits, per-process max_in_flight semaphores (fail-over when full), priority order, weighted tie-break with injectable rand.Source
+- [x] internal/db InferenceRequestRepo.Insert (+ integration-test coverage)
+- [x] POST /v1/chat/completions: MaxBytesReader 1 MiB (→413), strict DisallowUnknownFields validation, *float64/*int for temperature/max_tokens, stop string-or-array normalization, stream:true→400 unsupported_streaming, X-AegisRoute-Backend/-Routing-Policy headers, circuit outcome reporting, best-effort ledger row
+- [x] gateway-api wiring (shared Breaker for Selector + handler), .env.example MOCK_* block
+- [x] Definition of Done: gofmt/vet/build/test all clean, Docker-free
 
-## Stage 5 — Cache + idempotency + rate limiting
+## Stage 5 — Cache + idempotency + rate limiting (NEXT)
 
 - [ ] internal/cache: response cache, canonicalized cache keys, CACHE_TTL_SECONDS
 - [ ] internal/idempotency: Idempotency-Key fast path, IDEMPOTENCY_TTL_SECONDS

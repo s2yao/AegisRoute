@@ -55,17 +55,51 @@ flowchart LR
 1. **Foundations** (config, errors, logging, metrics scaffold) — ✅ **DONE** (`make verify` green)
 2. **Data layer** (migrations, db, redisstore, models, repos) — ✅ **DONE**
 3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
-4. Sync inference (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) ← **NEXT**
-5. Cache + idempotency + rate limiting
+4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE** (implemented + DoD green; **uncommitted** — see "Current state" below)
+5. Cache + idempotency + rate limiting ← **NEXT**
 6. Batch jobs + Redis Streams + control-worker
 7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification
+
+## Current state (2026-07-05)
+
+Stage 4 is fully implemented and the Definition of Done is green
+(`gofmt -l .` empty; `go vet ./...`, `go build ./...`, `go test ./...` all
+pass, Docker-free). The base implementation is committed as `f833d0e`
+("stage 4 implemented"). An adversarial review pass then produced
+**uncommitted hardening fixes** in the working tree (all verified green):
+
+- caller-context cancellation is classified as "canceled", never as a
+  transient backend failure (circuit breaker + metrics no longer poisoned by
+  client disconnects); `Breaker.ReportCanceled` returns a reserved half-open
+  probe slot;
+- chat validation is case-SENSITIVELY strict (stdlib JSON tag matching would
+  have accepted `"MODEL"`/`"Stream"`/`"Role"` aliases);
+- the inference_requests ledger insert runs on a context detached from the
+  request's cancellation, so disconnects can't erase audit rows;
+- `backoff()` honors a zero base; removed a review agent's stray
+  `zz_scratch_review_test.go` that `f833d0e` accidentally picked up.
+
+Since the branch is unpushed, fold the fixes into the stage commit:
+
+```
+git add -A && git commit --amend -m "feat: mock-llm, inference client, routing, circuit breaker, chat completions"
+```
+
+(or keep `f833d0e` and add a second commit, e.g. `fix: cancellation vs
+circuit breaker, case-sensitive chat validation, detached audit writes`).
+
+**Branch note:** work lives on `stage4_sync_inference_v2`, cut from
+`stage3_gateway_core` (60fca48). The older `stage4_Sync_inference` branch was
+mistakenly cut from the Stage-2 lineage and contains no Stage-3 code — do not
+resume there; its tree is byte-identical to the Stage-2 commit inside
+stage3's history, so it can be deleted.
 
 ## Scope table
 
 | Bucket | Contents |
 | --- | --- |
-| **Current stage (build now)** | Stages 1–3 COMPLETE. Next session builds Stage 4 only: cmd/mock-llm, internal/inference client (timeout/retry/max_in_flight), circuit breaker, internal/routing selection, /v1/chat/completions. |
-| **Future milestones (roadmap only)** | Stages 5–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
+| **Current stage (build now)** | Stages 1–4 COMPLETE (Stage 4 uncommitted). Next session builds Stage 5 only: internal/cache, internal/idempotency, internal/ratelimit, miniredis-backed tests, X-AegisRoute-Cache header. |
+| **Future milestones (roadmap only)** | Stages 6–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
 | **Context only (never a build order)** | Architecture diagram, locked stack, ports table, demo credentials, Docker/compose notes, resume-positioning language. |
 | **Non-goals (entire MVP; mention only in docs/future-work.md)** | k6, Grafana dashboards, Kubernetes, Terraform, real model providers, OIDC, RBAC, SSE/streaming, gRPC, sqlc, global/distributed concurrency control. |
 
