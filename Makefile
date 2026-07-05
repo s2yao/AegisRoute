@@ -1,0 +1,60 @@
+# AegisRoute Makefile — final target list (stubs are replaced in the stage
+# where their artifact lands).
+#
+# Config reads only os.Getenv (no dotenv library), so host-infra targets —
+# once implemented — must load .env first by prefixing their recipes with:
+#   set -a; [ -f .env ] && . ./.env; set +a; <command>
+
+SHELL := /bin/sh
+
+.DEFAULT_GOAL := help
+
+.PHONY: help fmt vet test verify test-integration migrate-up seed-dev \
+	dev-up dev-down logs verify-e2e clean
+
+help: ## List all targets with descriptions
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
+
+fmt: ## Format all Go source with gofmt
+	gofmt -w .
+
+vet: ## Run go vet on all packages
+	go vet ./...
+
+test: ## Run unit tests (no Docker/Postgres/Redis required)
+	go test ./...
+
+verify: ## Gate: gofmt clean, then go vet, then go test (no Docker)
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "gofmt required for:"; echo "$$unformatted"; exit 1; \
+	fi
+	go vet ./...
+	go test ./...
+
+test-integration: ## Run //go:build integration tests against real Postgres/Redis
+	@echo "not implemented until Stage 2"; exit 1
+
+migrate-up: ## Apply embedded DB migrations to DATABASE_URL
+	@echo "not implemented until Stage 2"; exit 1
+
+seed-dev: ## Seed demo tenant, API key, and backends
+	@echo "not implemented until Stage 3"; exit 1
+
+dev-up: ## Start the full local stack via docker compose
+	@echo "not implemented until Stage 7"; exit 1
+
+dev-down: ## Stop the local docker compose stack
+	@echo "not implemented until Stage 7"; exit 1
+
+logs: ## Tail docker compose logs
+	@echo "not implemented until Stage 7"; exit 1
+
+verify-e2e: ## Full end-to-end verification against the compose stack
+	@echo "not implemented until Stage 7"; exit 1
+
+clean: ## Remove build/test/coverage artifacts (never source)
+	go clean ./...
+	rm -rf bin dist
+	rm -f coverage.out coverage.html *.test *.prof
