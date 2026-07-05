@@ -27,6 +27,8 @@ tmp/
 .vscode/
 *.swp
 *.swo
+claude*
+CLAUDE*
 
 # OS metadata
 .DS_Store

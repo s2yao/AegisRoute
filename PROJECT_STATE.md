@@ -55,38 +55,35 @@ flowchart LR
 1. **Foundations** (config, errors, logging, metrics scaffold) — ✅ **DONE** (`make verify` green)
 2. **Data layer** (migrations, db, redisstore, models, repos) — ✅ **DONE**
 3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
-4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE** (implemented + DoD green; **uncommitted** — see "Current state" below)
+4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE**, committed (`c38a2a6`)
 5. Cache + idempotency + rate limiting ← **NEXT**
 6. Batch jobs + Redis Streams + control-worker
 7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification
 
 ## Current state (2026-07-05)
 
-Stage 4 is fully implemented and the Definition of Done is green
-(`gofmt -l .` empty; `go vet ./...`, `go build ./...`, `go test ./...` all
-pass, Docker-free). The base implementation is committed as `f833d0e`
-("stage 4 implemented"). An adversarial review pass then produced
-**uncommitted hardening fixes** in the working tree (all verified green):
+Stage 4 is fully implemented, committed as `c38a2a6` ("feat: mock-llm,
+inference client, routing, circuit breaker, chat completions"), and the
+Definition of Done is green (`gofmt -l .` empty; `go vet ./...`,
+`go build ./...`, `go test ./...` all pass, Docker-free). That commit
+includes an adversarial-review hardening pass folded in before commit:
 
 - caller-context cancellation is classified as "canceled", never as a
   transient backend failure (circuit breaker + metrics no longer poisoned by
   client disconnects); `Breaker.ReportCanceled` returns a reserved half-open
   probe slot;
 - chat validation is case-SENSITIVELY strict (stdlib JSON tag matching would
-  have accepted `"MODEL"`/`"Stream"`/`"Role"` aliases);
+  otherwise have accepted `"MODEL"`/`"Stream"`/`"Role"` aliases);
 - the inference_requests ledger insert runs on a context detached from the
   request's cancellation, so disconnects can't erase audit rows;
-- `backoff()` honors a zero base; removed a review agent's stray
-  `zz_scratch_review_test.go` that `f833d0e` accidentally picked up.
+- `backoff()` honors a zero base.
 
-Since the branch is unpushed, fold the fixes into the stage commit:
-
-```
-git add -A && git commit --amend -m "feat: mock-llm, inference client, routing, circuit breaker, chat completions"
-```
-
-(or keep `f833d0e` and add a second commit, e.g. `fix: cancellation vs
-circuit breaker, case-sensitive chat validation, detached audit writes`).
+This session also added AI-assistant context docs (no source changes):
+`CLAUDE.md` (root), `docs/REPO_MAP.md`, `docs/STAGE_STATUS.md`,
+`internal/db/CLAUDE.md`, `internal/routing/CLAUDE.md`,
+`internal/jobs/CLAUDE.md` (the requested "queue" rules — there is no
+`internal/queue` package; the `Queue` interface is documented to live in
+`internal/jobs`, see that file's naming note).
 
 **Branch note:** work lives on `stage4_sync_inference_v2`, cut from
 `stage3_gateway_core` (60fca48). The older `stage4_Sync_inference` branch was
@@ -98,7 +95,7 @@ stage3's history, so it can be deleted.
 
 | Bucket | Contents |
 | --- | --- |
-| **Current stage (build now)** | Stages 1–4 COMPLETE (Stage 4 uncommitted). Next session builds Stage 5 only: internal/cache, internal/idempotency, internal/ratelimit, miniredis-backed tests, X-AegisRoute-Cache header. |
+| **Current stage (build now)** | Stages 1–4 COMPLETE and committed. Next session builds Stage 5 only: internal/cache, internal/idempotency, internal/ratelimit, miniredis-backed tests, X-AegisRoute-Cache header. |
 | **Future milestones (roadmap only)** | Stages 6–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
 | **Context only (never a build order)** | Architecture diagram, locked stack, ports table, demo credentials, Docker/compose notes, resume-positioning language. |
 | **Non-goals (entire MVP; mention only in docs/future-work.md)** | k6, Grafana dashboards, Kubernetes, Terraform, real model providers, OIDC, RBAC, SSE/streaming, gRPC, sqlc, global/distributed concurrency control. |
@@ -130,8 +127,12 @@ prometheus         :9090
 
 ## How to resume
 
-1. Read this file, `TODO.md`, `IMPLEMENTATION_LOG.md`, `DECISIONS.md`.
+1. Read `CLAUDE.md` (entry point), then this file, `TODO.md`,
+   `IMPLEMENTATION_LOG.md`, `DECISIONS.md`. For structure, see
+   `docs/REPO_MAP.md` and `docs/STAGE_STATUS.md`.
 2. Run `make verify` (must be green before starting new work).
 3. Work on the first unchecked stage in `TODO.md` — and only that stage.
+   Check for a package-local `CLAUDE.md` (e.g. `internal/db/CLAUDE.md`)
+   before touching that package.
 4. Before stopping: update this file's stage status, tick `TODO.md`, append
    `IMPLEMENTATION_LOG.md`, and record any failing command + error verbatim.
