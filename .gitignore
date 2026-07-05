@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 
+
 # Go build & test artifacts
 bin/
 dist/
