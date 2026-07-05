@@ -34,10 +34,10 @@ verify: ## Gate: gofmt clean, then go vet, then go test (no Docker)
 	go test ./...
 
 test-integration: ## Run //go:build integration tests against real Postgres/Redis
-	@echo "not implemented until Stage 2"; exit 1
+	set -a; [ -f .env ] && . ./.env; set +a; go test -tags integration -count=1 ./...
 
 migrate-up: ## Apply embedded DB migrations to DATABASE_URL
-	@echo "not implemented until Stage 2"; exit 1
+	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/gateway-api -migrate
 
 seed-dev: ## Seed demo tenant, API key, and backends
 	@echo "not implemented until Stage 3"; exit 1
