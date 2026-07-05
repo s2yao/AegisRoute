@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/example/aegisroute/internal/auth"
+	"github.com/example/aegisroute/internal/httperror"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
 )
@@ -72,6 +73,12 @@ func NewRouter(deps Deps) http.Handler {
 	r.Use(metricsMiddleware(deps.Metrics))
 	r.Use(rejectQueryCredentials)
 
+	// Unmatched paths and unsupported methods must still return the canonical
+	// error envelope; chi's defaults are a plain-text 404 and an empty-body 405.
+	// These run inside the middleware chain, so they carry X-Request-ID too.
+	r.NotFound(notFound)
+	r.MethodNotAllowed(methodNotAllowed)
+
 	// Public: liveness, readiness, and the Prometheus scrape endpoint.
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", readyz(deps))
@@ -102,4 +109,16 @@ func NewRouter(deps Deps) http.Handler {
 	})
 
 	return r
+}
+
+// notFound answers an unmatched path with the canonical error envelope.
+func notFound(w http.ResponseWriter, r *http.Request) {
+	httperror.Write(w, r, http.StatusNotFound, httperror.CodeNotFound, "resource not found")
+}
+
+// methodNotAllowed answers a known path with an unsupported method using the
+// canonical envelope. There is no dedicated error code for 405, so the fixed
+// code set's bad_request is used with a 405 status.
+func methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	httperror.Write(w, r, http.StatusMethodNotAllowed, httperror.CodeBadRequest, "method not allowed")
 }

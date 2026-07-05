@@ -253,6 +253,7 @@ func TestCreatePolicyValidation(t *testing.T) {
 		"missing name":    {"model_name": "m", "strategy": "priority_weighted"},
 		"missing model":   {"name": "x", "strategy": "priority_weighted"},
 		"config as array": {"name": "x", "model_name": "m", "strategy": "priority_weighted", "config": []int{1, 2}},
+		"config null":     {"name": "x", "model_name": "m", "strategy": "priority_weighted", "config": nil},
 	}
 
 	router := api.NewRouter(testDeps())
@@ -288,6 +289,27 @@ func TestPatchPolicySoftDisablePreservesImmutables(t *testing.T) {
 	assert.Equal(t, "default", got["name"])
 	assert.Equal(t, "llama-fast", got["model_name"])
 	assert.Equal(t, "priority_weighted", got["strategy"])
+}
+
+func TestPatchPolicyRejectsNullConfig(t *testing.T) {
+	t.Parallel()
+
+	deps := testDeps()
+	store := newFakePolicyStore(models.RoutingPolicy{
+		Name: "default", ModelName: "llama-fast", Strategy: models.StrategyPriorityWeighted,
+		Config: json.RawMessage(`{}`), Enabled: true,
+	})
+	deps.Policies = store
+	router := api.NewRouter(deps)
+
+	id := store.order[0]
+	// config: null is not a JSON object and must be rejected, not stored.
+	rec := do(t, router, adminReq(t, http.MethodPatch, "/api/v1/routing-policies/"+id.String(),
+		map[string]any{"config": nil}))
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	env := decodeError(t, rec.Body)
+	assert.Equal(t, httperror.CodeBadRequest, env.Error.Code)
 }
 
 func TestCreateBackendBadJSON(t *testing.T) {

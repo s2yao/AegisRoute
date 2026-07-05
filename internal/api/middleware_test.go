@@ -95,6 +95,36 @@ func TestRecovererHandlesPanic(t *testing.T) {
 	assert.Equal(t, rec.Header().Get("X-Request-ID"), env.Error.RequestID)
 }
 
+func TestUnknownRouteReturnsCanonicalError(t *testing.T) {
+	t.Parallel()
+
+	router := api.NewRouter(testDeps())
+	rec := do(t, router, httptest.NewRequest(http.MethodGet, "/no/such/route", nil))
+
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Contains(t, rec.Header().Get("Content-Type"), "application/json",
+		"a 404 must use the canonical JSON error shape, not chi's plain-text default")
+	env := decodeError(t, rec.Body)
+	assert.Equal(t, httperror.CodeNotFound, env.Error.Code)
+	assert.Equal(t, rec.Header().Get("X-Request-ID"), env.Error.RequestID)
+	assert.NotEmpty(t, env.Error.RequestID)
+}
+
+func TestWrongMethodReturnsCanonicalError(t *testing.T) {
+	t.Parallel()
+
+	router := api.NewRouter(testDeps())
+	// /healthz is registered for GET only.
+	rec := do(t, router, httptest.NewRequest(http.MethodDelete, "/healthz", nil))
+
+	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Contains(t, rec.Header().Get("Content-Type"), "application/json",
+		"a 405 must use the canonical JSON error shape, not chi's empty-body default")
+	env := decodeError(t, rec.Body)
+	assert.Equal(t, httperror.CodeBadRequest, env.Error.Code)
+	assert.NotEmpty(t, env.Error.RequestID)
+}
+
 func TestBenignQueryParamAllowed(t *testing.T) {
 	t.Parallel()
 

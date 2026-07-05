@@ -131,6 +131,14 @@ func runServe(ctx context.Context) error {
 	m := metrics.New()
 
 	if cfg.AutoSeed {
+		// ValidateForServe intentionally omits the seed-only inputs (DEV_API_KEY,
+		// SEED_BACKEND_*_URL) so serving without auto-seed does not require them.
+		// When auto-seed is on, validate them now so a misconfiguration fails
+		// loudly at boot instead of silently seeding an unusable key and backends
+		// with empty base URLs.
+		if err := cfg.ValidateForSeed(); err != nil {
+			return err
+		}
 		if err := seed.Run(ctx, cfg, seedRepos(pool)); err != nil {
 			return err
 		}

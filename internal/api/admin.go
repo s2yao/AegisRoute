@@ -426,10 +426,12 @@ func isAbsoluteHTTPURL(raw string) bool {
 }
 
 // isJSONObject reports whether raw is a syntactically valid JSON object (as
-// opposed to an array, string, number, or null).
+// opposed to an array, string, number, or null). The obj != nil guard is what
+// rejects JSON null: unmarshaling "null" into a map succeeds but leaves the map
+// nil, whereas "{}" yields a non-nil empty map.
 func isJSONObject(raw json.RawMessage) bool {
 	var obj map[string]json.RawMessage
-	return json.Unmarshal(raw, &obj) == nil
+	return json.Unmarshal(raw, &obj) == nil && obj != nil
 }
 
 // defaultConfig returns raw when it carries content, or the "{}" default when
