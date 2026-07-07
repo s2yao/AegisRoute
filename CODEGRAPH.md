@@ -15,7 +15,9 @@ concerns: bearer/admin auth, backend routing, retry + circuit breaking,
 response cache, idempotency, per-key rate limiting, an audit ledger, and
 Prometheus metrics. Model backends are deterministic fakes (`mock-llm`) on
 purpose — the value is the control plane, not chatbot quality. Batch jobs and
-the `control-worker` are planned but not yet implemented (Stage 6).
+the `control-worker` (the asynchronous path: Redis Streams queue, transactional
+outbox, bounded idempotent worker, DLQ) are implemented as of Stage 6. Only
+Stage 7 (Docker/Compose/Prometheus/E2E/CI/docs) remains.
 Source: `PROJECT_STATE.md`, `go.mod`, `internal/api/router.go`.
 
 ## Languages and tooling
@@ -52,16 +54,22 @@ Source: `go.mod`, `Makefile`, `internal/*`, `DECISIONS.md`.
   identical input yields identical output) and `GET /healthz`; env `MOCK_*`
   (port, latency, jitter, failure rate, backend/model name). Startup:
   `go run ./cmd/mock-llm`. Downstream: none (standalone).
-- `cmd/control-worker/` — **Stage 6, not implemented.** Only a `.gitkeep`
-  exists. Intended role: consume batch jobs from a Redis Stream with a bounded
-  pool. Startup command: `unknown / needs verification`.
-Source: `cmd/gateway-api/main.go`, `cmd/mock-llm/main.go`, `Makefile`,
-`git ls-files cmd/control-worker/*`.
+- `cmd/control-worker/main.go` — **the batch worker (`:9100`).** Consumes
+  job-level messages from the Redis Stream with a bounded pool
+  (`WORKER_CONCURRENCY`), processes items idempotently against the shared
+  `internal/routing` + `internal/inference` (never over HTTP to gateway-api),
+  runs the stream-reclaim (XAUTOCLAIM) and outbox-drain tickers, and serves
+  `/healthz` + `/metrics` on `WORKER_METRICS_PORT`. Startup:
+  `go run ./cmd/control-worker` (needs `DATABASE_URL` + `REDIS_ADDR`).
+  Downstream: `internal/worker`, `internal/jobs`, `internal/redisstore`,
+  `internal/routing`, `internal/inference`, `internal/db`, `internal/config`,
+  `internal/metrics`, `internal/observability`.
+Source: `cmd/gateway-api/main.go`, `cmd/mock-llm/main.go`,
+`cmd/control-worker/main.go`, `Makefile`.
 
 ## Core modules
 
-Grouped by role. `internal/jobs` and `internal/worker` are scaffold-only
-(`doc.go`, no logic — Stage 6).
+Grouped by role.
 
 - `internal/api` — chi router, middleware chain, and all handlers (health,
   `/v1/models`, `/v1/chat/completions`, admin CRUD). Declares its own
@@ -89,17 +97,23 @@ Grouped by role. `internal/jobs` and `internal/worker` are scaffold-only
   `routing`, `inference`, `cache`, `idempotency`, `seed`.
 - `internal/db` — pgx pool, embedded goose migrations, and pgx repositories
   (`apikey_repo`, `backend_repo`, `routingpolicy_repo`, `tenant_repo`,
-  `inference_repo`, `idempotency_repo`). `errors.go` maps `pgx.ErrNoRows`→
-  `ErrNotFound` and unique violations. See `internal/db/CLAUDE.md`.
-- `internal/redisstore` — shared go-redis client + stream identifiers (stream
-  helpers land in Stage 6).
+  `inference_repo`, `idempotency_repo`, `job_repo`). `errors.go` maps
+  `pgx.ErrNoRows`→ `ErrNotFound` and unique violations; `job_repo.go` maps its
+  no-rows to `jobs.ErrNotFound` (the JobStore sentinel). See
+  `internal/db/CLAUDE.md`.
+- `internal/redisstore` — shared go-redis client + stream identifiers, plus
+  the batch `Queue` (`queue.go`: `Publish`/`Consume`/`Ack`/`Claim`/
+  `PublishDLQ` over Redis Streams — XADD, consumer group at offset 0,
+  XREADGROUP no-auto-ack, XACK, XAUTOCLAIM, `:dlq`) and the in-memory
+  `MemQueue` fake (`memqueue.go`). Used by the batch handler (publish) and the
+  worker (consume/ack/claim/dlq).
 - `internal/auth` — `BearerAuth` (HMAC-SHA256 key lookup) + `AdminAuth`
   (constant-time token compare) middleware; `Principal` context helpers.
 - `internal/seed` — idempotent demo-data seeder (`Run`).
 - `internal/inference` — `Client.Do(ctx, backend, body)`: one outbound backend
   call with per-attempt timeout, transient-only retry with full-jitter backoff,
   response size cap, typed transient/permanent/canceled errors. Shared by the
-  chat handler (and later the worker).
+  chat handler and the batch worker (both call it directly, never over HTTP).
 - `internal/routing` — `Selector.Select` (backend choice, policy fallback,
   per-process `max_in_flight` semaphores, priority + weighted tie-break,
   intra-request-failover exclusion) and `Breaker` (circuit breaker state
@@ -111,6 +125,16 @@ Grouped by role. `internal/jobs` and `internal/worker` are scaffold-only
   (Check/Begin/Complete/Release), `Scope`.
 - `internal/ratelimit` — per-API-key Redis fixed window (INCR+PEXPIRE in one
   Lua script); callers fail open.
+- `internal/jobs` — batch domain: pure status machines (`ValidJobTransition`,
+  `ValidItemTransition`, `AggregateJobStatus`), the `JobStore` interface +
+  claim result types + `jobs.ErrNotFound` sentinel, and the in-memory
+  `MemStore`. The Postgres impl is `db.JobRepo`. Used by the batch handlers
+  and the worker. See `internal/jobs/CLAUDE.md`.
+- `internal/worker` — `Worker` consumes job messages and processes items with
+  a bounded pool: atomic Postgres claim → shared routing+inference → durable
+  terminal write → recompute job status → `Ack` (only then). Crash-recovery
+  requeue, `WORKER_MAX_ITEM_ATTEMPTS`→DLQ, XAUTOCLAIM reclaim ticker, and
+  outbox-drain ticker. Used by `cmd/control-worker`.
 Source: `git ls-files internal/**`, `internal/api/router.go`, per-package
 `doc.go` and `CLAUDE.md`.
 
@@ -214,7 +238,7 @@ CI: `unknown / needs verification` — `.github/workflows/` contains only a
 
 - `go.sum` — dependency lock; do not hand-edit.
 - `.gitkeep` placeholder files in empty, not-yet-built dirs: `deploy/docker/`,
-  `observability/`, `scripts/`, `.github/workflows/`, `cmd/control-worker/`.
+  `observability/`, `scripts/`, `.github/workflows/` (all Stage 7).
 - `migrations/embed.go` — tiny `//go:embed` shim (not generated, but rarely the
   thing you need to change; edit the `.sql` files instead).
 - Build/test artifacts (all gitignored): `bin/`, `dist/`, `coverage.*`,
@@ -252,8 +276,8 @@ CI: `unknown / needs verification` — `.github/workflows/` contains only a
 - `internal/config/config.go`: env var surface, validators.
 - `internal/metrics/metrics.go`: the `aegisroute_*` metric names.
 - `migrations/` (00001..00006 + `embed.go`): schema, ordering, embed.
-- `cmd/gateway-api/main.go`, `cmd/mock-llm/main.go`, `cmd/control-worker/.gitkeep`:
-  entrypoints and the not-yet-built worker.
+- `cmd/gateway-api/main.go`, `cmd/mock-llm/main.go`, `cmd/control-worker/main.go`:
+  the three binary entrypoints.
 - `git ls-files`, `.gitignore`: tracked vs ignored (note: `CLAUDE.md` files are
   gitignored via `CLAUDE*`; `CODEGRAPH.md` is not).
 - Existing docs cross-checked: `PROJECT_STATE.md`, `DECISIONS.md`,

@@ -17,8 +17,10 @@ import (
 	"github.com/example/aegisroute/internal/cache"
 	"github.com/example/aegisroute/internal/db"
 	"github.com/example/aegisroute/internal/idempotency"
+	"github.com/example/aegisroute/internal/jobs"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
+	"github.com/example/aegisroute/internal/redisstore"
 )
 
 const (
@@ -47,6 +49,8 @@ func testDeps() api.Deps {
 		Cache:       noopCache{},
 		Limiter:     allowAllLimiter{},
 		Idempotency: bypassIdempotency{},
+		Jobs:        jobs.NewMemStore(),
+		JobQueue:    redisstore.NewMemQueue(),
 	}
 }
 

@@ -181,6 +181,38 @@ func (c *Config) ValidateForServe() error {
 	return join(errs)
 }
 
+// ValidateForWorker checks exactly what control-worker needs: durable stores
+// (Postgres + Redis), the stream identity, the backend call tuning it shares
+// with the gateway, and the worker pool settings. It deliberately does NOT
+// require the gateway-only inputs (ADMIN_TOKEN, APP_KEY_HASH_SECRET, APP_PORT,
+// RATE_LIMIT_QPS, CACHE_TTL_SECONDS, IDEMPOTENCY_TTL_SECONDS) — the worker
+// authenticates nobody, serves no chat API, and caches nothing, so forcing it
+// to carry those secrets just to boot would be wrong.
+func (c *Config) ValidateForWorker() error {
+	var errs []string
+	requireNonEmpty(&errs, "DATABASE_URL", c.DatabaseURL)
+	requireNonEmpty(&errs, "REDIS_ADDR", c.RedisAddr)
+	if c.RedisDB < 0 {
+		errs = append(errs, "REDIS_DB: must be >= 0")
+	}
+	requirePort(&errs, "WORKER_METRICS_PORT", c.WorkerMetricsPort)
+	requireLogLevel(&errs, c.LogLevel)
+	requirePositive(&errs, "BACKEND_TIMEOUT_MS", c.BackendTimeoutMS)
+	requirePositive(&errs, "RETRY_MAX_ATTEMPTS", c.RetryMaxAttempts)
+	requirePositive(&errs, "RETRY_BASE_MS", c.RetryBaseMS)
+	requirePositive(&errs, "RETRY_MAX_MS", c.RetryMaxMS)
+	if c.RetryMaxMS >= 1 && c.RetryBaseMS >= 1 && c.RetryMaxMS < c.RetryBaseMS {
+		errs = append(errs, "RETRY_MAX_MS: must be >= RETRY_BASE_MS")
+	}
+	requirePositive(&errs, "CB_FAILURE_THRESHOLD", c.CBFailureThreshold)
+	requirePositive(&errs, "CB_COOLDOWN_MS", c.CBCooldownMS)
+	requirePositive(&errs, "WORKER_CONCURRENCY", c.WorkerConcurrency)
+	requirePositive(&errs, "WORKER_MAX_ITEM_ATTEMPTS", c.WorkerMaxItemAttempts)
+	requireNonEmpty(&errs, "STREAM_KEY", c.StreamKey)
+	requireNonEmpty(&errs, "STREAM_GROUP", c.StreamGroup)
+	return join(errs)
+}
+
 // InferenceBudget is the wall-clock ceiling the chat handler gives the whole
 // inference operation (all failover attempts combined): ServerWriteTimeout
 // minus the response margin, so the reply still has time to reach the client.

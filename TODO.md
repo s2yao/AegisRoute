@@ -62,11 +62,17 @@ starts.
 - [x] Handler integration tests (miniredis + fakes): MISS→HIT (different idempotency keys)→429; replay skips rate limit; changed-body 409; concurrent same-key → one pending record + 409 in-progress; invalid/429 create no records; error responses complete + replay; /v1/models 429 + window refill
 - [x] Definition of Done: gofmt/vet/build/test all clean, Docker-free (also -race)
 
-## Stage 6 — Batch jobs + control-worker (NEXT)
+## Stage 6 — Batch jobs + control-worker (DONE — uncommitted; see PROJECT_STATE.md)
 
-- [ ] Queue interface: Redis Streams impl + in-memory fake
-- [ ] /api/v1/batch-jobs* endpoints; job/item status machine
-- [ ] cmd/control-worker: consumer group, bounded pool (WORKER_CONCURRENCY), WORKER_MAX_ITEM_ATTEMPTS then DLQ, /healthz + /metrics on :9100
+- [x] `internal/redisstore` Queue interface (Publish/Consume/Ack/Claim/PublishDLQ) + Message; Redis Streams adapter (XADD, XGROUP MKSTREAM at offset 0, XREADGROUP per-instance consumer, XACK, XAUTOCLAIM, `:dlq` XADD); Consume never auto-acks; in-memory MemQueue fake with publish-error injection + DLQ/ack/inflight introspection
+- [x] `internal/jobs` pure status machines (ValidJobTransition, ValidItemTransition, AggregateJobStatus) + JobStore interface (CreateWithItemsAndOutbox, Get/List/Items tenant-scoped, MarkJobRunning, RequeueRunningItems, ClaimNextQueuedItem, UpdateItemTerminal, RecomputeAndUpdateJobStatus, PendingOutbox, MarkOutboxPublished, MarkOutboxFailedAttempt) + in-memory MemStore
+- [x] `internal/db/job_repo.go` JobRepo: transactional create (job+items+outbox in one tx); atomic claim via `FOR UPDATE SKIP LOCKED` with claim-time exhaustion; terminal-immutable item update (`WHERE status='running'`); status recompute in SQL mirroring AggregateJobStatus; outbox drain/publish/fail marks; tenant-scoped reads
+- [x] `internal/api` batch handlers: POST /api/v1/batch-jobs (10 MiB cap, MVP schema validation reusing Stage-4 chat validation, same-model rule, 1..100 items, unique custom_id, Stage-5 idempotency precedence, exactly one job-level publish, outbox stays pending on publish failure); GET list/get/items all tenant-filtered; BatchJobStore + JobPublisher Deps interfaces; wired into bearer group
+- [x] `internal/worker` bounded pool (semaphore = WORKER_CONCURRENCY), per-item claim loop, shared routing+inference (never HTTP to gateway-api), durable terminal write before Ack, Ack only after RecomputeAndUpdateJobStatus, crash-recovery requeue of stranded running items, WORKER_MAX_ITEM_ATTEMPTS → DLQ, periodic XAUTOCLAIM reclaim loop + outbox-drain loop, panic-safe pool goroutines
+- [x] `cmd/control-worker/main.go`: config→logger→pgx pool→redis→metrics→queue/selector/inference/store/worker; consume + reclaim + outbox tickers via worker.Run; /healthz + /metrics on WORKER_METRICS_PORT; graceful shutdown on SIGINT/SIGTERM
+- [x] Metrics: BatchJobsCreatedTotal (create), BatchItemsProcessedTotal{outcome} (worker), WorkerFailuresTotal (worker-level failures)
+- [x] Tests (Docker-free): pure status machine (all transitions + 3 aggregations); MemStore (tenant scoping, atomic concurrent claims never duplicate, exhaustion, terminal immutability, aggregation, outbox lifecycle); queue adapter over miniredis (publish→consume→ack, Consume-no-auto-ack + Claim recovers stranded via SetTime, DLQ stream, backlog before group); MemQueue fake; worker pool (concurrency peak ≤ limit, redelivery skips terminal items, Ack-after-durable-update via instrumented fakes, exhaustion→DLQ+job failed, partial-failure aggregation, outbox-drain retries then marks published); batch endpoints (persist+one publish, publish-failure keeps outbox pending, GET/items/list, idempotency replay, cross-tenant 404, validation matrix); JobRepo integration subtests (`//go:build integration`)
+- [x] Definition of Done: gofmt/vet/build/test all clean, Docker-free (also `-race` on worker/redisstore/jobs/api); `go build ./cmd/control-worker` green
 
 ## Stage 7 — Docker/Compose/Prometheus/E2E/docs/CI
 

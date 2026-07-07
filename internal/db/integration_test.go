@@ -15,6 +15,7 @@ import (
 
 	"github.com/example/aegisroute/internal/config"
 	"github.com/example/aegisroute/internal/idempotency"
+	"github.com/example/aegisroute/internal/jobs"
 	"github.com/example/aegisroute/internal/models"
 )
 
@@ -400,4 +401,155 @@ func TestIntegration(t *testing.T) {
 		assert.NoError(t, err, "a released key Begins fresh")
 		assert.NoError(t, repo.Release(ctx, relID), "releasing an already-gone id is a no-op")
 	})
+
+	t.Run("JobRepo", func(t *testing.T) {
+		tenant, err := NewTenantRepo(pool).Upsert(ctx, "acme-batch")
+		require.NoError(t, err)
+		other, err := NewTenantRepo(pool).Upsert(ctx, "other-batch")
+		require.NoError(t, err)
+		key, err := NewAPIKeyRepo(pool).Upsert(ctx, tenant.ID, "batch-key", "hash-batch")
+		require.NoError(t, err)
+
+		repo := NewJobRepo(pool)
+
+		// CreateWithItemsAndOutbox persists the job (queued), its items
+		// (queued), and one pending outbox row in one transaction.
+		job, outbox, err := repo.CreateWithItemsAndOutbox(ctx, models.BatchJob{
+			TenantID: tenant.ID,
+			APIKeyID: key.ID,
+			Model:    "llama-fast",
+		}, []models.BatchJobItem{
+			{CustomID: "a", Request: json.RawMessage(`{"model":"llama-fast"}`)},
+			{CustomID: "b", Request: json.RawMessage(`{"model":"llama-fast"}`)},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, models.JobStatusQueued, job.Status)
+		assert.Equal(t, 2, job.TotalItems)
+		assert.Equal(t, models.OutboxStatusPending, outbox.Status)
+		assert.Equal(t, job.ID, outbox.JobID)
+
+		// Tenant scoping: the owner reads it, another tenant gets ErrNotFound.
+		got, err := repo.Get(ctx, tenant.ID, job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, job.ID, got.ID)
+		_, err = repo.Get(ctx, other.ID, job.ID)
+		assert.ErrorIs(t, err, jobs.ErrNotFound, "another tenant must not read the job")
+		_, err = repo.Items(ctx, other.ID, job.ID)
+		assert.ErrorIs(t, err, jobs.ErrNotFound)
+
+		list, err := repo.List(ctx, tenant.ID)
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+		assert.Equal(t, job.ID, list[0].ID)
+		assert.Empty(t, mustList(t, repo, other.ID), "another tenant's list is empty")
+
+		items, err := repo.Items(ctx, tenant.ID, job.ID)
+		require.NoError(t, err)
+		require.Len(t, items, 2)
+		assert.Equal(t, "a", items[0].CustomID)
+
+		// MarkJobRunning is idempotent: queued→running once, then a no-op.
+		require.NoError(t, repo.MarkJobRunning(ctx, job.ID))
+		got, err = repo.Get(ctx, tenant.ID, job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, models.JobStatusRunning, got.Status)
+		require.NoError(t, repo.MarkJobRunning(ctx, job.ID), "second MarkJobRunning is a no-op")
+
+		// Claim both items; each claim is atomic and increments attempts.
+		claim1, err := repo.ClaimNextQueuedItem(ctx, job.ID, 3)
+		require.NoError(t, err)
+		require.Equal(t, jobs.ClaimClaimed, claim1.Outcome)
+		assert.Equal(t, 1, claim1.Item.Attempts)
+		assert.Equal(t, models.ItemStatusRunning, claim1.Item.Status)
+
+		claim2, err := repo.ClaimNextQueuedItem(ctx, job.ID, 3)
+		require.NoError(t, err)
+		require.Equal(t, jobs.ClaimClaimed, claim2.Outcome)
+		assert.NotEqual(t, claim1.Item.ID, claim2.Item.ID, "two claims never return the same item")
+
+		// No queued items remain.
+		none, err := repo.ClaimNextQueuedItem(ctx, job.ID, 3)
+		require.NoError(t, err)
+		assert.Equal(t, jobs.ClaimNone, none.Outcome)
+
+		// Terminal write succeeds once; a second write finds no running row.
+		require.NoError(t, repo.UpdateItemTerminal(ctx, claim1.Item.ID,
+			models.ItemStatusSucceeded, json.RawMessage(`{"ok":true}`), nil))
+		err = repo.UpdateItemTerminal(ctx, claim1.Item.ID, models.ItemStatusFailed, nil, strPtr("no overwrite"))
+		assert.ErrorIs(t, err, jobs.ErrNotFound, "a terminal item is immutable")
+
+		// One success, one failure → partially_failed with the counters set.
+		require.NoError(t, repo.UpdateItemTerminal(ctx, claim2.Item.ID,
+			models.ItemStatusFailed, nil, strPtr("boom")))
+		status, err := repo.RecomputeAndUpdateJobStatus(ctx, job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, models.JobStatusPartiallyFailed, status)
+		got, err = repo.Get(ctx, tenant.ID, job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 1, got.CompletedItems)
+		assert.Equal(t, 1, got.FailedItems)
+
+		// Outbox: pending → failed attempt stays pending → published clears it.
+		pending, err := repo.PendingOutbox(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, pending, 1)
+		assert.Equal(t, outbox.ID, pending[0].ID)
+
+		require.NoError(t, repo.MarkOutboxFailedAttempt(ctx, outbox.ID, "redis down"))
+		pending, err = repo.PendingOutbox(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, pending, 1)
+		assert.Equal(t, 1, pending[0].Attempts)
+		require.NotNil(t, pending[0].LastError)
+
+		require.NoError(t, repo.MarkOutboxPublished(ctx, outbox.ID))
+		pending, err = repo.PendingOutbox(ctx, 10)
+		require.NoError(t, err)
+		assert.Empty(t, pending, "a published row leaves the pending set")
+	})
+
+	t.Run("JobRepoClaimExhaustion", func(t *testing.T) {
+		tenant, err := NewTenantRepo(pool).Upsert(ctx, "acme-exhaust")
+		require.NoError(t, err)
+		key, err := NewAPIKeyRepo(pool).Upsert(ctx, tenant.ID, "exhaust-key", "hash-exhaust")
+		require.NoError(t, err)
+		repo := NewJobRepo(pool)
+
+		job, _, err := repo.CreateWithItemsAndOutbox(ctx, models.BatchJob{
+			TenantID: tenant.ID, APIKeyID: key.ID, Model: "llama-fast",
+		}, []models.BatchJobItem{{CustomID: "solo", Request: json.RawMessage(`{"model":"llama-fast"}`)}})
+		require.NoError(t, err)
+
+		// maxAttempts=1: claim (attempts→1), requeue (crash recovery), then
+		// the next claim would need attempts=2>1 so it exhausts the item
+		// terminally instead of leaving it stuck queued.
+		c, err := repo.ClaimNextQueuedItem(ctx, job.ID, 1)
+		require.NoError(t, err)
+		require.Equal(t, jobs.ClaimClaimed, c.Outcome)
+		_, err = repo.RequeueRunningItems(ctx, job.ID)
+		require.NoError(t, err)
+
+		ex, err := repo.ClaimNextQueuedItem(ctx, job.ID, 1)
+		require.NoError(t, err)
+		require.Equal(t, jobs.ClaimExhausted, ex.Outcome)
+		assert.Equal(t, models.ItemStatusFailed, ex.Item.Status)
+		require.NotNil(t, ex.Item.Error)
+		assert.Contains(t, *ex.Item.Error, "exhausted")
+
+		// The exhausted item is terminal, so nothing remains claimable.
+		none, err := repo.ClaimNextQueuedItem(ctx, job.ID, 1)
+		require.NoError(t, err)
+		assert.Equal(t, jobs.ClaimNone, none.Outcome)
+	})
 }
+
+// mustList is a small helper for the JobRepo subtest's negative-space
+// assertion.
+func mustList(t *testing.T, repo *JobRepo, tenantID uuid.UUID) []models.BatchJob {
+	t.Helper()
+	list, err := repo.List(context.Background(), tenantID)
+	require.NoError(t, err)
+	return list
+}
+
+func strPtr(s string) *string { return &s }

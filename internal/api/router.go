@@ -108,6 +108,27 @@ type IdempotencyGate interface {
 	Release(ctx context.Context, recordID uuid.UUID) error
 }
 
+// BatchJobStore is the subset of the batch-job store the API depends on:
+// transactional creation plus tenant-scoped reads and the outbox marks for
+// the create-path publish. Absence is reported as jobs.ErrNotFound (the
+// JobStore contract's sentinel). Satisfied by *db.JobRepo and *jobs.MemStore.
+type BatchJobStore interface {
+	CreateWithItemsAndOutbox(ctx context.Context, job models.BatchJob, items []models.BatchJobItem) (models.BatchJob, models.BatchJobOutbox, error)
+	Get(ctx context.Context, tenantID, jobID uuid.UUID) (models.BatchJob, error)
+	List(ctx context.Context, tenantID uuid.UUID) ([]models.BatchJob, error)
+	Items(ctx context.Context, tenantID, jobID uuid.UUID) ([]models.BatchJobItem, error)
+	MarkOutboxPublished(ctx context.Context, outboxID uuid.UUID) error
+	MarkOutboxFailedAttempt(ctx context.Context, outboxID uuid.UUID, lastErr string) error
+}
+
+// JobPublisher is the queue's publish side, all the API ever touches: one
+// job-level message per created batch job (never one per item). Publish
+// failures are absorbed by the transactional outbox, not surfaced to the
+// client. Satisfied by *redisstore.StreamQueue and *redisstore.MemQueue.
+type JobPublisher interface {
+	Publish(ctx context.Context, jobID string) error
+}
+
 // Deps is everything NewRouter needs to wire the gateway. The composition root
 // (cmd/gateway-api) fills it from real repositories, pingers, and config; tests
 // fill it with fakes.
@@ -128,6 +149,8 @@ type Deps struct {
 	Cache         ResponseCache
 	Limiter       RateLimiter
 	Idempotency   IdempotencyGate
+	Jobs          BatchJobStore
+	JobQueue      JobPublisher
 	// InferenceBudget caps the wall-clock time the chat handler spends across
 	// all failover attempts for one request; zero means no extra budget beyond
 	// the request context (used in tests). Production sets it from
@@ -172,6 +195,16 @@ func NewRouter(deps Deps) http.Handler {
 		br.Use(auth.BearerAuth(deps.KeyHashSecret, deps.Keys))
 		br.With(rateLimitMiddleware(deps)).Get("/v1/models", listModels(deps))
 		br.Post("/v1/chat/completions", chatCompletions(deps))
+		// Batch jobs are tenant routes (bearer auth, never admin). The GETs
+		// take the shared per-key rate budget via the middleware; the create
+		// handler, like chat, checks the same budget inline at its precedence
+		// point (after the idempotency replay lookup) — never both.
+		br.Route("/api/v1/batch-jobs", func(bj chi.Router) {
+			bj.Post("/", createBatchJob(deps))
+			bj.With(rateLimitMiddleware(deps)).Get("/", listBatchJobs(deps))
+			bj.With(rateLimitMiddleware(deps)).Get("/{id}", getBatchJob(deps))
+			bj.With(rateLimitMiddleware(deps)).Get("/{id}/items", listBatchJobItems(deps))
+		})
 	})
 
 	// Admin-token control plane. Scoped to exactly the backend and

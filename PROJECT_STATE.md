@@ -56,11 +56,171 @@ flowchart LR
 2. **Data layer** (migrations, db, redisstore, models, repos) — ✅ **DONE**
 3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
 4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE**, committed (`c38a2a6` + polish `eed317c`)
-5. **Cache + idempotency + rate limiting** — ✅ **DONE** (implemented + DoD green; **uncommitted** — see "Current state")
-6. Batch jobs + Redis Streams + control-worker ← **NEXT**
-7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification
+5. **Cache + idempotency + rate limiting** — ✅ **DONE** (committed on branch)
+6. **Batch jobs + Redis Streams + control-worker** — ✅ **DONE** (implemented + DoD green; **uncommitted** — see "Current state")
+7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification ← **NEXT**
 
-## Current state (2026-07-06) — Stage 5 DONE, uncommitted
+## Current state (2026-07-07) — Stage 6 DONE, uncommitted
+
+Stage 6 (the full asynchronous path) is implemented and the Definition of
+Done is green: `gofmt -l .` empty, `go vet ./...`, `go build ./...`,
+`go test ./...` all pass Docker-free (worker/redisstore/jobs/api also under
+`-race`), and `go build ./cmd/control-worker` builds. **Deliberately
+uncommitted** per instruction. Suggested commit:
+
+```
+git commit -m "feat: batch jobs, redis streams queue, control-worker with bounded pool and DLQ"
+```
+
+What shipped (Stage 6):
+
+- **`internal/redisstore` queue** — `Queue` interface
+  (`Publish`/`Consume`/`Ack`/`Claim`/`PublishDLQ`) + `Message{ID,JobID}`.
+  Redis Streams adapter (`queue.go`): `XADD` publish; consumer group created
+  with `MKSTREAM` at offset **0** (so a worker booted after the API already
+  published still drains the backlog); `XREADGROUP` per-instance consumer
+  that **never auto-acks**; `XACK` in `Ack`; `XAUTOCLAIM` in `Claim`; `XADD`
+  to `<stream>:dlq` in `PublishDLQ`. In-memory `MemQueue` fake (`memqueue.go`)
+  mirrors the at-least-once contract (delivery → in-flight set, Ack the only
+  exit, handler error leaves it recoverable, `Claim` by idle age) with
+  publish-error injection and DLQ/ack/inflight/pending introspection for tests.
+- **`internal/jobs`** — pure status machines (`status.go`:
+  `ValidJobTransition`, `ValidItemTransition`, `AggregateJobStatus`), the
+  `JobStore` interface + claim result types (`store.go`), and the in-memory
+  `MemStore` (`memstore.go`). `jobs.ErrNotFound` is the store's absence
+  sentinel (db imports jobs for the claim types, mirroring db←idempotency).
+- **`internal/db/job_repo.go`** — `JobRepo`: `CreateWithItemsAndOutbox` in one
+  transaction (job=queued + N items=queued + one pending outbox row);
+  `ClaimNextQueuedItem` atomic via `FOR UPDATE SKIP LOCKED` with claim-time
+  exhaustion (attempts+1 > max → item durably failed, `ClaimExhausted`);
+  `UpdateItemTerminal` guarded by `WHERE status='running'` (terminal items
+  immutable → redelivery-safe); `RecomputeAndUpdateJobStatus` derives status
+  in SQL mirroring `AggregateJobStatus`; `RequeueRunningItems` for crash
+  recovery; outbox drain/publish/fail marks; all reads tenant-scoped.
+- **`internal/api` batch handlers** (`batch.go`) — `POST /api/v1/batch-jobs`
+  (10 MiB cap; MVP schema `{requests:[{custom_id,body}]}`; reuses the Stage-4
+  chat validation per item body; 1..100 items; unique non-empty custom_id;
+  same-model rule stored in `batch_jobs.model`; **Stage-5 idempotency
+  precedence** — Check → rate limit → Begin → work → Complete/Release;
+  transactional create then **exactly one** job-level publish; publish failure
+  marks the outbox failed-attempt and leaves it pending, never orphaning the
+  job). `GET` list/get/items **all tenant-filtered** (cross-tenant read = 404).
+  New Deps interfaces `BatchJobStore` + `JobPublisher`; wired into the bearer
+  group (GETs take the shared per-key rate budget via middleware, create checks
+  it inline like chat).
+- **`internal/worker`** (`worker.go`) — `Worker` consumes job messages: set
+  job running → **bounded pool** (semaphore = `WORKER_CONCURRENCY`) each
+  goroutine repeatedly `ClaimNextQueuedItem` → shared `internal/routing` +
+  `internal/inference` (with intra-item failover; **never HTTP to
+  gateway-api**) → durable terminal write → after all items terminal,
+  `RecomputeAndUpdateJobStatus` → **only then `Ack`**. Redelivery-safe
+  (terminal items unclaimable). `RequeueRunningItems` recovers items a crashed
+  worker left running. Exhaustion (`WORKER_MAX_ITEM_ATTEMPTS`) → exactly one
+  DLQ entry per item, keep processing the rest. Periodic `Claim` (XAUTOCLAIM)
+  reclaim loop + periodic outbox-drain loop (`PendingOutbox` → `Publish` →
+  `MarkOutboxPublished`, mark published only after publish succeeds). Pool
+  goroutines are panic-safe (no ack → redelivery).
+- **`cmd/control-worker/main.go`** — config → logger → pgx pool → redis →
+  metrics → shared breaker/selector/inference/queue/store/worker →
+  `worker.Run` (consume + reclaim + outbox tickers) + `/healthz` + `/metrics`
+  on `WORKER_METRICS_PORT` → graceful shutdown on SIGINT/SIGTERM.
+- **Metrics** — `BatchJobsCreatedTotal` (create), `BatchItemsProcessedTotal
+  {outcome}` (worker per-item), `WorkerFailuresTotal` (worker-level failures,
+  not per-item business failures).
+
+Stage-6 tests (all Docker-free): pure status machine (every transition + all
+three aggregations); MemStore (tenant scoping, concurrent claims never
+duplicate, exhaustion, terminal immutability, aggregation, outbox lifecycle);
+queue adapter over **miniredis** (publish→consume→ack; Consume-no-auto-ack +
+`Claim` recovers a stranded pending message using `mr.SetTime` — note
+`FastForward` does NOT age stream PEL entries, only TTLs; DLQ stream; backlog
+published before the group existed); MemQueue fake; **worker pool** (white-box:
+concurrency peak ≤ limit via atomic counter, redelivery skips terminal items,
+**Ack strictly after the durable store update** via instrumented recording
+wrappers, exhausted item → DLQ + job failed, partial-failure aggregation,
+outbox-drain retries then marks published only after publish succeeds); batch
+endpoints (create persists job+items+one outbox row + exactly one publish;
+publish failure keeps outbox pending; GET/items/list; idempotency-key replay
+returns same job id and doesn't re-create or re-publish; cross-tenant GET/items
+= 404; validation matrix). `internal/db/integration_test.go` gains `JobRepo`
+and `JobRepoClaimExhaustion` subtests (`//go:build integration`; `stage2Tables`
+already lists the batch tables).
+
+### Post-Stage-6 verification pass (2 end-to-end runs) — 4 fixes (uncommitted, DoD green under -race)
+
+Two full dataflow verifications (sync chat path + async batch path) surfaced
+and fixed four issues; no unusable-level (build/tests/demo path were already
+green), but two were Major worker-durability bugs:
+
+1. **MAJOR — poison message on a vanished job:** a valid-UUID message whose job
+   was deleted (its tenant removed, cascading) reached
+   `RecomputeAndUpdateJobStatus` → `jobs.ErrNotFound` → `failJobPass` → never
+   acked, so the reclaim loop redelivered it **forever**, spamming
+   `WorkerFailuresTotal` and DB queries every tick. Fix: `handleMessage` now
+   treats `jobs.ErrNotFound` from `MarkJobRunning`/`RecomputeAndUpdateJobStatus`
+   as terminal — `dropMissingJob` dead-letters and acks the moot message
+   (`internal/worker/worker.go`).
+2. **MAJOR — reclaim self-race → premature exhaustion:** for a job whose single
+   delivery ran longer than `ReclaimMinIdle` (60s), the same process's reclaim
+   loop `XAUTOCLAIM`ed the still-in-flight message and ran a second concurrent
+   pass; its `RequeueRunningItems` bounced items the consume loop was actively
+   processing back to `queued`, and with a small `WORKER_MAX_ITEM_ATTEMPTS`
+   the re-claim could **exhaust (DLQ) an item that was actually succeeding**.
+   Fix: the worker tracks in-flight delivery IDs (`markInFlight`/`isInFlight`);
+   `reclaimOnce` skips deliveries this process is already handling, and
+   `handleMessage` has an in-flight backstop that no-ops a double entry.
+3. **OTHER — unbounded Redis stream growth:** `XACK` removes an entry from the
+   group's pending list but not from the stream, so `XADD` without trimming
+   grew `aegisroute:batch_jobs` (and `:dlq`) without bound. Fix: approximate
+   `MAXLEN ~100000` on both `XADD`s (`internal/redisstore/queue.go`).
+4. **OTHER — worker required gateway-only config:** `control-worker` called
+   `ValidateForServe`, which demands `ADMIN_TOKEN`, `APP_KEY_HASH_SECRET`,
+   `APP_PORT`, `RATE_LIMIT_QPS`, `CACHE_TTL_SECONDS`, `IDEMPOTENCY_TTL_SECONDS`
+   the worker never uses. Fix: new `config.ValidateForWorker()` checks only the
+   stores, backend/retry/CB tuning, stream identity, and worker settings;
+   `cmd/control-worker` uses it.
+
+Also **closed a coverage gap**: added `TestWorker_EndToEndOverStreamQueue` —
+`worker.Run` driving the real Redis-Streams consume loop over miniredis
+(publish → consume → process → ack), which the unit tests (direct
+`handleMessage`) had not exercised. New tests: worker missing-job-drop,
+in-flight guard, the E2E path, and `ValidateForWorker`.
+
+Verified-correct (no change needed): the exhaustion math (`WORKER_MAX_ITEM_ATTEMPTS=N`
+→ N processing attempts then DLQ, no off-by-one); idempotent redelivery never
+double-counts `BatchItemsProcessedTotal` (terminal items unclaimable, terminal
+write guarded); the per-process circuit breaker is correctly shared by the
+worker's selector and outcome reports; a transient failure that exhausts
+failover is a terminal item result by design (cross-delivery retry via
+`WORKER_MAX_ITEM_ATTEMPTS` is for crash recovery, not backend blips).
+
+Files touched by the fixes: `internal/worker/worker.go` (+ `worker_test.go`),
+`internal/redisstore/queue.go`, `internal/config/config.go` (+ `config_test.go`),
+`cmd/control-worker/main.go`.
+
+### Stage-6 design notes / non-obvious decisions
+
+- **`jobs.ErrNotFound` (not `db.ErrNotFound`)** is the JobStore absence
+  sentinel: `db` imports `jobs` for `ClaimResult`/`ClaimOutcome`, so the
+  sentinel lives in `jobs`; `job_repo.go`'s `mapJobsNotFound` converts
+  driver no-rows to it. Handlers and the worker test `errors.Is(err,
+  jobs.ErrNotFound)`.
+- **Consumer group at offset 0 + `ensureGroup` only on Consume/Claim** (not
+  Publish) — the API publishes before any worker may exist; the group must
+  replay from the beginning, not `$`.
+- **`RequeueRunningItems` is necessary, not cosmetic:** without it, an item a
+  crashed worker left `running` is never re-selected (claims only pick
+  `queued`) and the job would never terminate → the message would redeliver
+  forever. Concurrent duplicate deliveries (only via reclaim after 60s idle)
+  can double-process an item, but that is idempotent (terminal items
+  immutable, no double count) and bounded — acceptable per the "no distributed
+  coordination beyond Postgres claims" non-goal.
+- **Ack ordering is the at-least-once contract** and is asserted directly with
+  instrumented store/queue wrappers recording call order.
+- Did **not** add `prometheus/testutil` for a counter assertion (it pulls a
+  new transitive module `kylelemons/godebug`); kept the locked dependency set.
+
+## Prior state (2026-07-06) — Stage 5 DONE
 
 Stage 5 is fully implemented and the Definition of Done is green
 (`gofmt -l .` empty; `go vet ./...`, `go build ./...`, `go test ./...` all
@@ -189,8 +349,8 @@ stage3's history, so it can be deleted.
 
 | Bucket | Contents |
 | --- | --- |
-| **Current stage (build now)** | Stages 1–5 COMPLETE (Stage 5 uncommitted). Next session builds Stage 6 only: Queue interface (internal/jobs) + Redis Streams impl + in-memory fake, /api/v1/batch-jobs* endpoints, cmd/control-worker. Read internal/jobs/CLAUDE.md first. |
-| **Future milestones (roadmap only)** | Stage 7. Do not create its source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
+| **Current stage (build now)** | Stages 1–6 COMPLETE (Stage 6 uncommitted). Next session builds Stage 7 only: Dockerfiles + docker-compose (postgres, redis, both mock-llms, gateway, worker, prometheus), Prometheus scrape config, `make dev-up/dev-down/logs/verify-e2e`, E2E script, GitHub Actions CI, full README + docs/future-work.md, final verification. |
+| **Future milestones (roadmap only)** | None after Stage 7 (final stage). Do not create Stage-7 assets before starting Stage 7. |
 | **Context only (never a build order)** | Architecture diagram, locked stack, ports table, demo credentials, Docker/compose notes, resume-positioning language. |
 | **Non-goals (entire MVP; mention only in docs/future-work.md)** | k6, Grafana dashboards, Kubernetes, Terraform, real model providers, OIDC, RBAC, SSE/streaming, gRPC, sqlc, global/distributed concurrency control. |
 

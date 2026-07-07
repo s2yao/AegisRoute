@@ -197,6 +197,10 @@ func runServe(ctx context.Context) error {
 		Limiter:       ratelimit.New(rdb, cfg.RateLimitQPS, time.Second),
 		Idempotency: idempotency.NewCoordinator(db.NewIdempotencyRepo(pool),
 			time.Duration(cfg.IdempotencyTTLSeconds)*time.Second, idempotencyLockTTL),
+		Jobs: db.NewJobRepo(pool),
+		// The API only publishes; the consumer name is irrelevant on this
+		// side but kept truthful for debuggability.
+		JobQueue:        redisstore.NewStreamQueue(rdb, redisstore.StreamsFromConfig(cfg), redisstore.ConsumerName()),
 		InferenceBudget: cfg.InferenceBudget(),
 	})
 
