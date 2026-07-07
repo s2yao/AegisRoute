@@ -58,10 +58,18 @@ func (r *IdempotencyRepo) Lookup(ctx context.Context, scope, key, requestHash st
 func (r *IdempotencyRepo) Begin(ctx context.Context, scope, key, requestHash string, ttl, lockTTL time.Duration) (uuid.UUID, error) {
 	// Status literals match the table's CHECK constraint; the models
 	// constants mirror them (IdempotencyStatusPending).
+	// The reclaim path (ON CONFLICT DO UPDATE) mints a FRESH id
+	// (id = gen_random_uuid()). This is load-bearing, not cosmetic: it makes
+	// the record identity change on every acquisition, so the previous —
+	// possibly still-running or crashed — owner's Complete(oldID) finds no
+	// row and safely no-ops instead of overwriting the new owner's in-flight
+	// record with a stale response. Keeping the original id (Postgres's
+	// default for DO UPDATE) would let a lapsed owner clobber the reclaimer.
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO idempotency_records (scope, idem_key, request_hash, status, locked_until, expires_at)
 		VALUES ($1, $2, $3, 'pending', now() + make_interval(secs => $4), now() + make_interval(secs => $5))
 		ON CONFLICT (scope, idem_key) DO UPDATE SET
+			id = gen_random_uuid(),
 			request_hash = EXCLUDED.request_hash,
 			status = 'pending',
 			locked_until = EXCLUDED.locked_until,
@@ -105,6 +113,22 @@ func (r *IdempotencyRepo) Complete(ctx context.Context, recordID uuid.UUID, stat
 	var id uuid.UUID
 	if err := row.Scan(&id); err != nil {
 		return fmt.Errorf("db: complete idempotency record %s: %w", recordID, mapNotFound(err))
+	}
+	return nil
+}
+
+// Release deletes a still-pending record so a same-key retry starts fresh. It
+// is the terminal action for retryable (5xx) outcomes: a transient failure
+// must not be cached and replayed for the whole TTL, or a client reusing its
+// Idempotency-Key (exactly what retry-safety asks of it) would be locked out
+// of a working gateway. A record already reclaimed or completed by someone
+// else is left untouched (the status/id guard), so Release only ever removes
+// the caller's own in-flight record. A missing row is not an error.
+func (r *IdempotencyRepo) Release(ctx context.Context, recordID uuid.UUID) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM idempotency_records WHERE id = $1 AND status = 'pending'`,
+		recordID); err != nil {
+		return fmt.Errorf("db: release idempotency record %s: %w", recordID, err)
 	}
 	return nil
 }

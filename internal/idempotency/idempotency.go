@@ -79,11 +79,16 @@ type IdempotencyStore interface {
 	Lookup(ctx context.Context, scope, key, requestHash string) (LookupResult, error)
 	// Begin atomically inserts a pending record — or reclaims an expired or
 	// stale-pending one — locked for lockTTL and expiring after ttl. When the
-	// record is held by someone else it returns ErrRecordActive.
+	// record is held by someone else it returns ErrRecordActive. A reclaim
+	// mints a fresh record id so the previous owner can no longer Complete it.
 	Begin(ctx context.Context, scope, key, requestHash string, ttl, lockTTL time.Duration) (uuid.UUID, error)
 	// Complete marks a pending record completed with the response to replay.
 	// headers and body are JSON (headers: an object of header name → value).
 	Complete(ctx context.Context, recordID uuid.UUID, status int, headers, body []byte) error
+	// Release removes a still-pending record so a same-key retry starts fresh.
+	// It is the terminal action for retryable outcomes; a record already
+	// reclaimed or completed by another request is left untouched.
+	Release(ctx context.Context, recordID uuid.UUID) error
 }
 
 // Scope builds the idempotency scope, matching the format documented on the
@@ -180,6 +185,18 @@ func (c *Coordinator) Begin(ctx context.Context, scope, key, requestHash string)
 	// Absent/Stale here means the blocker changed again mid-race; telling the
 	// client the request is in progress is always safe — a retry resolves it.
 	return c.decideFromLookup(res, ActionInProgress)
+}
+
+// Release discards an opened record without storing a replayable response,
+// so a same-key retry is treated as new work. Used for retryable (5xx)
+// outcomes, where caching the failure would defeat the point of an
+// Idempotency-Key. Best-effort: a failure is the caller's to log, not
+// surface, since the record's lock lapses on its own.
+func (c *Coordinator) Release(ctx context.Context, recordID uuid.UUID) error {
+	if err := c.store.Release(ctx, recordID); err != nil {
+		return fmt.Errorf("idempotency: release: %w", err)
+	}
+	return nil
 }
 
 // Complete stores the final response on an opened record. headers must not

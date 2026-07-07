@@ -387,5 +387,17 @@ func TestIntegration(t *testing.T) {
 		// Scopes are isolated: the same key in another scope is independent.
 		_, err = repo.Begin(ctx, "tenant:t2:key:k2:POST:/v1/chat/completions", "key-1", hashA, ttl, lockTTL)
 		assert.NoError(t, err)
+
+		// Release deletes a pending record so the key is free to retry; a
+		// released key Begins fresh, and releasing a superseded id is a no-op.
+		relID, err := repo.Begin(ctx, scope, "key-release", hashA, ttl, lockTTL)
+		require.NoError(t, err)
+		require.NoError(t, repo.Release(ctx, relID))
+		res, err = repo.Lookup(ctx, scope, "key-release", hashA)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.OutcomeAbsent, res.Outcome, "a released record is gone")
+		_, err = repo.Begin(ctx, scope, "key-release", hashB, ttl, lockTTL)
+		assert.NoError(t, err, "a released key Begins fresh")
+		assert.NoError(t, repo.Release(ctx, relID), "releasing an already-gone id is a no-op")
 	})
 }

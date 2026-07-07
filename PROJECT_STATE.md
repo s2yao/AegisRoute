@@ -99,9 +99,35 @@ What shipped:
   `docs/design-decisions.md` (required precedence note + fail-open/closed
   stances).
 
-Stage-5 tests: 11 handler-integration tests (miniredis + real
+Stage-5 tests: 14 handler-integration tests (miniredis + real
 cache/limiter/coordinator over an in-memory store), plus package tests for
 cache/idempotency/ratelimit and the db integration subtest.
+
+**Post-Stage-5 verification pass (2 rounds) found and fixed 3 issues (all
+uncommitted, DoD still green under -race):**
+
+1. **CRITICAL — idempotency reclaim id (data-integrity):** the Postgres
+   `Begin` used `ON CONFLICT DO UPDATE` which KEEPS the original PK id, but
+   the in-memory fakes and the integration test assume a reclaim mints a
+   FRESH id. Consequences: (a) the integration test would FAIL on real
+   Postgres, and (b) a crashed/lapsed owner's `Complete(oldID)` could
+   overwrite the reclaimer's in-flight record with a stale response. Fixed by
+   adding `id = gen_random_uuid()` to the reclaim `SET`, so the old owner's
+   `Complete`/`Release` safely no-op.
+2. **CRITICAL — transient errors were cached under the idempotency key:** a
+   5xx (e.g. a momentary all-backends-down 503) was stored and replayed for
+   the whole TTL (24h default), so a client correctly reusing its
+   Idempotency-Key on retry was locked out even after the gateway recovered.
+   Fixed: added `Release` to the store/coordinator/gate; `respondChat` now
+   Completes only `< 500` (success + deterministic 4xx) and Releases `>= 500`
+   so the retry is a fresh attempt.
+3. **Hardening — unbounded Idempotency-Key:** capped at 255 chars, rejected
+   with 400 before any store interaction (it is part of a unique index).
+
+Files touched by the fixes: internal/db/idempotency_repo.go,
+internal/idempotency/idempotency.go (+ _test), internal/api/chat.go +
+router.go (+ chat_stage5_test, helpers_test), internal/db/integration_test.go,
+DECISIONS.md, docs/design-decisions.md.
 
 ## Stage 4 state (2026-07-05)
 

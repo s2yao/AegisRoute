@@ -40,6 +40,12 @@ const (
 // from the request's own lifetime.
 const idempotencyCompleteTimeout = 5 * time.Second
 
+// maxIdempotencyKeyLen caps the Idempotency-Key. The key becomes part of a
+// Postgres unique index; an unbounded client-supplied value is a storage and
+// index-bloat vector, so an over-long key is rejected before it ever reaches
+// the store. 255 matches common practice (Stripe).
+const maxIdempotencyKeyLen = 255
+
 // ChatMessage is one validated conversation turn: a known role and a
 // non-empty string content.
 type ChatMessage struct {
@@ -348,6 +354,13 @@ func chatCompletions(deps Deps) http.HandlerFunc {
 
 		scope := idempotency.Scope(principal.TenantID, principal.APIKeyID, r.Method, routePattern(r))
 		idemKey := strings.TrimSpace(r.Header.Get(idempotency.Header))
+		if len(idemKey) > maxIdempotencyKeyLen {
+			// Rejected before any store interaction, so an oversized key never
+			// creates a record.
+			httperror.Write(w, r, http.StatusBadRequest, httperror.CodeBadRequest,
+				fmt.Sprintf("Idempotency-Key must not exceed %d characters", maxIdempotencyKeyLen))
+			return
+		}
 		rawHash := sha256Hex(raw)
 
 		// Idempotency replay/conflict lookup runs BEFORE rate limiting: a
@@ -521,21 +534,35 @@ func applyIdempotencyDecision(w http.ResponseWriter, r *http.Request, dec idempo
 	}
 }
 
-// respondChat sends the final response, first completing an opened
-// idempotency record with the same status/whitelisted headers/body so a
-// retry with the same key replays exactly what this request answered —
-// including error envelopes (deterministic retries; see
-// docs/design-decisions.md). The completion runs on a context detached from
-// the request so a client disconnect cannot strand the record pending.
+// respondChat sends the final response and resolves an opened idempotency
+// record before writing it, so the record is never left pending. How it
+// resolves depends on the status:
+//
+//   - < 500 (success, or a deterministic client error like 404): Complete —
+//     the same key replays this exact status/whitelisted-headers/body.
+//   - >= 500 (a retryable server/upstream failure): Release — the record is
+//     discarded so a same-key retry gets a fresh attempt instead of the
+//     failure being cached and replayed for the whole TTL. Caching a
+//     transient 503 would lock a correctly-retrying client out of a gateway
+//     that has since recovered (see docs/design-decisions.md).
+//
+// Resolution runs on a context detached from the request so a client
+// disconnect cannot strand the record pending.
 func respondChat(w http.ResponseWriter, r *http.Request, deps Deps, recordID *uuid.UUID,
 	status int, headers map[string]string, body []byte) {
 	if recordID != nil {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), idempotencyCompleteTimeout)
 		defer cancel()
-		if err := deps.Idempotency.Complete(ctx, *recordID, status, headers, body); err != nil {
-			// Best-effort: the response is still served; the stranded pending
+		var err error
+		if status >= http.StatusInternalServerError {
+			err = deps.Idempotency.Release(ctx, *recordID)
+		} else {
+			err = deps.Idempotency.Complete(ctx, *recordID, status, headers, body)
+		}
+		if err != nil {
+			// Best-effort: the response is still served; a stranded pending
 			// record is reclaimed after its lock lapses.
-			deps.Logger.Error("failed to complete idempotency record",
+			deps.Logger.Error("failed to resolve idempotency record",
 				"record_id", *recordID, "status", status, "error", err)
 		}
 	}

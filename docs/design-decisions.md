@@ -56,17 +56,30 @@ chat route in the middleware too would charge every request twice.
   idempotency are **separate mechanisms with separate keys**: two E2E chat
   calls with different `Idempotency-Key`s do not replay (different keys) but
   the second is a genuine cache HIT (same canonical body).
-- **A cache HIT still completes the opened idempotency record** (13 covers
+- **A cache HIT still resolves the opened idempotency record** (13 covers
   9): no path after Begin may leave a record pending, or same-key retries
   would 409 until the lock lapses.
-- **Errors after Begin also Complete the record** — a retry with the same
-  key replays the recorded error envelope (deterministic retries, the
-  Stripe-style contract). The replayed *body* is the original envelope
-  (including its `request_id` field, which identifies the request that
-  actually executed); the `X-Request-ID` **header** is always the current
-  request's — it is never stored and never replayed.
+- **How a record resolves depends on the status (step 13):**
+  - **< 500** (success, or a deterministic client error like a 404 unknown
+    model): **Complete** — a same-key retry replays the recorded
+    status/whitelisted-headers/body. The replayed *body* is the original
+    envelope (its `request_id` field names the request that actually
+    executed); the `X-Request-ID` **header** is always the current
+    request's — never stored, never replayed.
+  - **>= 500** (a retryable server/upstream failure — 503 upstream
+    unavailable, 502, 500): **Release** — the pending record is deleted, not
+    stored. A transient blip must not be cached and replayed for the full
+    `IDEMPOTENCY_TTL_SECONDS` (24h by default): a client reusing its
+    Idempotency-Key — exactly what retry-safety asks of it — would otherwise
+    be locked out of a gateway that has since recovered. Releasing lets the
+    retry make a fresh attempt. This is the Stripe stance: results are saved
+    only for definitive outcomes; server-side failures stay retryable.
 - **429 and 409 responses are never cached and never counted as cache
-  events**: they end the request before the cache lookup.
+  events**: they end the request before the cache lookup. 429 also ends
+  before Begin, so it never creates a record.
+- **The Idempotency-Key is capped at 255 characters** (rejected with 400
+  before any store interaction): the key is part of a Postgres unique index,
+  so an unbounded client value is an index-bloat/storage vector.
 
 ## Failure-mode stances (fail open vs fail closed)
 
@@ -76,6 +89,12 @@ chat route in the middleware too would charge every request twice.
 - **Idempotency store errors fail CLOSED with 500**: replay correctness
   cannot be guessed — serving new work when a completed record might exist
   would break the exactly-once illusion the client was promised.
-- **A failed Complete is logged, not surfaced**: the response is served; the
-  stranded pending record is reclaimed after its lock TTL (2× the server
-  write deadline, so a live request is never reclaimed mid-flight).
+- **A failed Complete/Release is logged, not surfaced**: the response is
+  served; a stranded pending record is reclaimed after its lock TTL (2× the
+  server write deadline, so a live request is never reclaimed mid-flight).
+- **A reclaim mints a fresh record id** (`Begin`'s `ON CONFLICT DO UPDATE`
+  sets `id = gen_random_uuid()`): the previous owner — crashed, or alive but
+  past its lock — can no longer `Complete`/`Release` the row a new request
+  reclaimed, so a stale response can never overwrite the reclaimer's
+  in-flight record. `Complete`/`Release` both guard on `id AND status =
+  'pending'`, so they only ever touch the caller's own record.

@@ -103,6 +103,9 @@ type IdempotencyGate interface {
 	Check(ctx context.Context, scope, key, requestHash string) (idempotency.Decision, error)
 	Begin(ctx context.Context, scope, key, requestHash string) (idempotency.Decision, error)
 	Complete(ctx context.Context, recordID uuid.UUID, status int, headers map[string]string, body []byte) error
+	// Release discards an opened record so a same-key retry is fresh work
+	// (used for retryable 5xx outcomes).
+	Release(ctx context.Context, recordID uuid.UUID) error
 }
 
 // Deps is everything NewRouter needs to wire the gateway. The composition root

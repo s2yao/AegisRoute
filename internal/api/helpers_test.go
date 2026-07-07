@@ -81,6 +81,8 @@ func (bypassIdempotency) Complete(context.Context, uuid.UUID, int, map[string]st
 	return nil
 }
 
+func (bypassIdempotency) Release(context.Context, uuid.UUID) error { return nil }
+
 // decodeError parses a response body into the standard error envelope.
 func decodeError(t *testing.T, body io.Reader) struct {
 	Error struct {

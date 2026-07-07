@@ -21,6 +21,7 @@ import (
 	"github.com/example/aegisroute/internal/inference"
 	"github.com/example/aegisroute/internal/models"
 	"github.com/example/aegisroute/internal/ratelimit"
+	"github.com/example/aegisroute/internal/routing"
 )
 
 // fakeIdemStore is the api-side in-memory idempotency.IdempotencyStore,
@@ -97,6 +98,18 @@ func (f *fakeIdemStore) Complete(_ context.Context, recordID uuid.UUID, status i
 		}
 	}
 	return idempotency.ErrRecordActive
+}
+
+func (f *fakeIdemStore) Release(_ context.Context, recordID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, rec := range f.records {
+		if rec.ID == recordID && rec.Status == models.IdempotencyStatusPending {
+			delete(f.records, k)
+			return nil
+		}
+	}
+	return nil
 }
 
 func (f *fakeIdemStore) pendingLocked() int {
@@ -334,26 +347,70 @@ func TestStage5RateLimitedRequestCreatesNoRecord(t *testing.T) {
 	assert.Zero(t, total, "the rate limit runs before idempotency Begin")
 }
 
-func TestStage5ErrorResponseCompletesRecordAndReplays(t *testing.T) {
+func TestStage5RetryableErrorReleasesRecordSoRetryIsFresh(t *testing.T) {
+	// A transient 5xx must NOT be cached under the idempotency key: the record
+	// is released so a same-key retry (exactly what a retry-safe client does)
+	// gets a fresh attempt against a gateway that may have recovered — rather
+	// than the failure being replayed for the whole TTL.
 	f := newStage5Fixture(t, 100)
+	var down atomic.Bool
+	down.Store(true)
 	f.deps.Inference = inferenceFunc(func(context.Context, models.ModelBackend, []byte) (*inference.Response, error) {
-		return nil, &inference.Error{Backend: "mock-llm-fast", Status: 503, Transient: true}
+		atomic.AddInt64(&f.backends, 1)
+		if down.Load() {
+			return nil, &inference.Error{Backend: "mock-llm-fast", Status: 503, Transient: true}
+		}
+		return &inference.Response{StatusCode: http.StatusOK, Body: []byte(upstreamJSON)}, nil
 	})
 	f.rebuild()
 
 	first := f.postChatKeyed(t, validChatBody, "err-key", "")
 	assert.Equal(t, http.StatusServiceUnavailable, first.Code)
-	pending, completed, _ := f.store.counts()
-	assert.Zero(t, pending, "an error response still completes the opened record")
-	assert.Equal(t, 1, completed)
+	pending, completed, total := f.store.counts()
+	assert.Zero(t, pending, "the opened record is resolved, never left pending")
+	assert.Zero(t, completed, "a retryable 5xx is not stored as a completed replay")
+	assert.Zero(t, total, "the record is released, so nothing is cached under the key")
 
-	// The same key replays the recorded 503 deterministically (documented in
-	// docs/design-decisions.md) — the backend is not retried under this key.
+	// The backend recovers; the SAME key now succeeds instead of replaying 503.
+	down.Store(false)
 	calls := f.backendCalls()
 	second := f.postChatKeyed(t, validChatBody, "err-key", "")
-	assert.Equal(t, http.StatusServiceUnavailable, second.Code)
-	assert.Equal(t, first.Body.String(), second.Body.String())
-	assert.Equal(t, calls, f.backendCalls(), "a replayed error does not touch a backend")
+	assert.Equal(t, http.StatusOK, second.Code,
+		"a same-key retry after a transient failure gets a fresh attempt")
+	assert.Greater(t, f.backendCalls(), calls, "the retry actually reaches the backend")
+
+	pending, completed, _ = f.store.counts()
+	assert.Zero(t, pending)
+	assert.Equal(t, 1, completed, "the successful retry is now the stored, replayable outcome")
+}
+
+func TestStage5DeterministicClientErrorIsReplayed(t *testing.T) {
+	// A 404 (model not served by any backend) is deterministic client-side:
+	// unlike a 5xx it IS completed and replayed, and never reaches a backend.
+	f := newStage5Fixture(t, 100)
+	f.selector.err = routing.ErrNoBackends
+	f.rebuild()
+
+	first := f.postChatKeyed(t, validChatBody, "notfound-key", "")
+	require.Equal(t, http.StatusNotFound, first.Code)
+	_, completed, _ := f.store.counts()
+	assert.Equal(t, 1, completed, "a deterministic 4xx is completed for replay")
+
+	second := f.postChatKeyed(t, validChatBody, "notfound-key", "")
+	assert.Equal(t, http.StatusNotFound, second.Code)
+	assert.Equal(t, first.Body.String(), second.Body.String(), "the 404 replays deterministically")
+	assert.Equal(t, int64(0), f.backendCalls())
+}
+
+func TestStage5OversizedIdempotencyKeyRejected(t *testing.T) {
+	f := newStage5Fixture(t, 100)
+	huge := strings.Repeat("k", 256)
+	rec := f.postChatKeyed(t, validChatBody, huge, "")
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, "bad_request", decodeError(t, rec.Body).Error.Code)
+	_, _, total := f.store.counts()
+	assert.Zero(t, total, "an oversized key never creates a record")
+	assert.Equal(t, int64(0), f.backendCalls(), "and never reaches a backend")
 }
 
 // --- /v1/models shares the per-key budget ---------------------------------------

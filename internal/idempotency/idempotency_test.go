@@ -89,6 +89,18 @@ func (f *fakeStore) Complete(_ context.Context, recordID uuid.UUID, status int, 
 	return ErrRecordActive // no pending record with that id
 }
 
+func (f *fakeStore) Release(_ context.Context, recordID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, rec := range f.records {
+		if rec.ID == recordID && rec.Status == models.IdempotencyStatusPending {
+			delete(f.records, k)
+			return nil
+		}
+	}
+	return nil // a missing/superseded record is not an error
+}
+
 func (f *fakeStore) pendingCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -294,6 +306,43 @@ func TestCoordinatorReclaimsStalePending(t *testing.T) {
 	// The dead owner's late Complete must not corrupt the reclaimed record.
 	err = c.Complete(ctx, firstID, 200, nil, []byte(`{}`))
 	assert.Error(t, err, "completing a reclaimed (superseded) record fails")
+}
+
+func TestCoordinatorReleaseAllowsFreshRetry(t *testing.T) {
+	c, store, _ := newTestCoordinator()
+	ctx := context.Background()
+
+	first, err := c.Begin(ctx, testScope, "key-1", hashA)
+	require.NoError(t, err)
+	require.NoError(t, c.Release(ctx, first.RecordID))
+	assert.Zero(t, store.pendingCount(), "Release removes the pending record")
+
+	// The key is free again: a same-key request is new work, not a replay.
+	dec, err := c.Check(ctx, testScope, "key-1", hashA)
+	require.NoError(t, err)
+	assert.Equal(t, ActionProceed, dec.Action, "a released key is treated as absent")
+
+	again, err := c.Begin(ctx, testScope, "key-1", hashA)
+	require.NoError(t, err)
+	assert.Equal(t, ActionStarted, again.Action)
+}
+
+func TestCoordinatorReleaseIgnoresSupersededRecord(t *testing.T) {
+	c, store, clock := newTestCoordinator()
+	ctx := context.Background()
+
+	first, err := c.Begin(ctx, testScope, "key-1", hashA)
+	require.NoError(t, err)
+
+	// The lock lapses and another request reclaims the key.
+	clock.advance(testLockTTL + time.Second)
+	second, err := c.Begin(ctx, testScope, "key-1", hashA)
+	require.NoError(t, err)
+	require.NotEqual(t, first.RecordID, second.RecordID)
+
+	// The original owner's late Release must not remove the reclaimer's record.
+	require.NoError(t, c.Release(ctx, first.RecordID))
+	assert.Equal(t, 1, store.pendingCount(), "Release only removes the caller's own pending record")
 }
 
 func TestCoordinatorExpiredRecordTreatedAsNew(t *testing.T) {
