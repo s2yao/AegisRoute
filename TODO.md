@@ -50,14 +50,19 @@ starts.
 - [x] gateway-api wiring (shared Breaker for Selector + handler), .env.example MOCK_* block
 - [x] Definition of Done: gofmt/vet/build/test all clean, Docker-free
 
-## Stage 5 — Cache + idempotency + rate limiting (NEXT)
+## Stage 5 — Cache + idempotency + rate limiting (DONE — uncommitted; see PROJECT_STATE.md)
 
-- [ ] internal/cache: response cache, canonicalized cache keys, CACHE_TTL_SECONDS
-- [ ] internal/idempotency: Idempotency-Key fast path, IDEMPOTENCY_TTL_SECONDS
-- [ ] internal/ratelimit: per-key limiter, RATE_LIMIT_QPS
-- [ ] miniredis-backed unit tests for all three
+- [x] internal/cache: Eligible (stream:false + effective temp ≤ 0.2; omitted → 1.0, explicit 0 cacheable), CanonicalBody (sorted keys, array order preserved), Key = sha256(scope ‖ canonical body), Redis Get/Put with CACHE_TTL_SECONDS; miniredis tests (stability, TTL expiry, corrupt-entry fail-open)
+- [x] internal/idempotency: Classify (single semantics source), IdempotencyStore (Lookup/Begin/Complete) satisfied by db.IdempotencyRepo, Coordinator (Check/Begin/Complete), Scope (tenant+key+method+route, Stage-6 reusable), IDEMPOTENCY_TTL_SECONDS + lock TTL; in-memory-fake tests (replay/conflict/in-progress/stale-reclaim/expired/race)
+- [x] internal/db/idempotency_repo.go: atomic INSERT…ON CONFLICT…WHERE reclaim on DB clock; integration subtest (insert/conflict/reclaim/complete/expiry/scope isolation)
+- [x] internal/ratelimit: per-API-key fixed window, INCR+PEXPIRE in one Lua invocation (expiry can never be lost), RATE_LIMIT_QPS; miniredis + FastForward tests; fail-open on Redis errors
+- [x] Chat handler exact precedence: raw body once → raw-bytes hash → validate → idempotency Check → rate limit (new work only) → Begin → cache lookup → route/inference → cache store (2xx+eligible) → ledger (cache_result set; HIT rows backend_id NULL) → Complete on every path; X-AegisRoute-Cache HIT|MISS|BYPASS; replays never reuse stored X-Request-ID
+- [x] rateLimitMiddleware on GET /v1/models (shared per-key budget; chat checks inline); 429 rate_limited + aegisroute_rate_limited_total; aegisroute_cache_events_total{result}
+- [x] cmd/gateway-api wiring (lock TTL = 2× ServerWriteTimeout); docs/design-decisions.md precedence note
+- [x] Handler integration tests (miniredis + fakes): MISS→HIT (different idempotency keys)→429; replay skips rate limit; changed-body 409; concurrent same-key → one pending record + 409 in-progress; invalid/429 create no records; error responses complete + replay; /v1/models 429 + window refill
+- [x] Definition of Done: gofmt/vet/build/test all clean, Docker-free (also -race)
 
-## Stage 6 — Batch jobs + control-worker
+## Stage 6 — Batch jobs + control-worker (NEXT)
 
 - [ ] Queue interface: Redis Streams impl + in-memory fake
 - [ ] /api/v1/batch-jobs* endpoints; job/item status machine

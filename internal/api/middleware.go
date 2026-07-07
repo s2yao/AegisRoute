@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/example/aegisroute/internal/auth"
 	"github.com/example/aegisroute/internal/httperror"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/observability"
@@ -185,4 +186,47 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// allowRate consults the per-API-key limiter, writing the 429 itself when
+// the key is over budget. Limiter errors fail OPEN: a Redis outage degrades
+// rate limiting, never availability. Shared by rateLimitMiddleware and the
+// chat handler's inline check.
+func allowRate(w http.ResponseWriter, r *http.Request, deps Deps, principal auth.Principal) bool {
+	ok, err := deps.Limiter.Allow(r.Context(), principal.APIKeyID.String())
+	if err != nil {
+		deps.Logger.Warn("rate limiter unavailable; failing open", "error", err)
+		return true
+	}
+	if !ok {
+		deps.Metrics.RateLimitedTotal.Inc()
+		httperror.Write(w, r, http.StatusTooManyRequests, httperror.CodeRateLimited,
+			"rate limit exceeded for this API key")
+		return false
+	}
+	return true
+}
+
+// rateLimitMiddleware applies the per-key limit to simple bearer routes
+// (GET /v1/models today; Stage 6 adds the batch-jobs routes). It must run
+// inside the bearer group, after BearerAuth, because the limit is keyed by
+// the authenticated API key. POST /v1/chat/completions deliberately does NOT
+// use this middleware: its limit check runs inside the handler, after the
+// idempotency replay lookup and before a pending record is opened — see
+// docs/design-decisions.md.
+func rateLimitMiddleware(deps Deps) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			principal, ok := auth.PrincipalFromContext(r.Context())
+			if !ok {
+				httperror.Write(w, r, http.StatusInternalServerError, httperror.CodeInternal,
+					"missing authenticated principal")
+				return
+			}
+			if !allowRate(w, r, deps, principal) {
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

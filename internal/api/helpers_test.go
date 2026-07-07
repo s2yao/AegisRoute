@@ -14,7 +14,9 @@ import (
 
 	"github.com/example/aegisroute/internal/api"
 	"github.com/example/aegisroute/internal/auth"
+	"github.com/example/aegisroute/internal/cache"
 	"github.com/example/aegisroute/internal/db"
+	"github.com/example/aegisroute/internal/idempotency"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
 )
@@ -42,7 +44,41 @@ func testDeps() api.Deps {
 		Policies:    newFakePolicyStore(),
 		DBPinger:    stubPinger{},
 		RedisPinger: stubPinger{},
+		Cache:       noopCache{},
+		Limiter:     allowAllLimiter{},
+		Idempotency: bypassIdempotency{},
 	}
+}
+
+// --- benign Stage-5 pass-through fakes ---------------------------------------
+// Tests not exercising cache/rate-limit/idempotency get these no-ops; the
+// Stage-5 handler integration tests swap in the real implementations over
+// miniredis (see chat_stage5_test.go).
+
+// noopCache always misses and stores nothing.
+type noopCache struct{}
+
+func (noopCache) Get(context.Context, string) (*cache.Entry, error) { return nil, nil }
+func (noopCache) Put(context.Context, string, cache.Entry) error    { return nil }
+
+// allowAllLimiter never limits.
+type allowAllLimiter struct{}
+
+func (allowAllLimiter) Allow(context.Context, string) (bool, error) { return true, nil }
+
+// bypassIdempotency proceeds without ever creating records.
+type bypassIdempotency struct{}
+
+func (bypassIdempotency) Check(context.Context, string, string, string) (idempotency.Decision, error) {
+	return idempotency.Decision{Action: idempotency.ActionProceed}, nil
+}
+
+func (bypassIdempotency) Begin(context.Context, string, string, string) (idempotency.Decision, error) {
+	return idempotency.Decision{Action: idempotency.ActionProceed}, nil
+}
+
+func (bypassIdempotency) Complete(context.Context, uuid.UUID, int, map[string]string, []byte) error {
+	return nil
 }
 
 // decodeError parses a response body into the standard error envelope.

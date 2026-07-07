@@ -21,12 +21,15 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/example/aegisroute/internal/api"
+	"github.com/example/aegisroute/internal/cache"
 	"github.com/example/aegisroute/internal/config"
 	"github.com/example/aegisroute/internal/db"
+	"github.com/example/aegisroute/internal/idempotency"
 	"github.com/example/aegisroute/internal/inference"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
 	"github.com/example/aegisroute/internal/observability"
+	"github.com/example/aegisroute/internal/ratelimit"
 	"github.com/example/aegisroute/internal/redisstore"
 	"github.com/example/aegisroute/internal/routing"
 	"github.com/example/aegisroute/internal/seed"
@@ -177,24 +180,34 @@ func runServe(ctx context.Context) error {
 	defer ledger.Close()
 
 	handler := api.NewRouter(api.Deps{
-		Logger:          logger,
-		Metrics:         m,
-		KeyHashSecret:   cfg.AppKeyHashSecret,
-		AdminToken:      cfg.AdminToken,
-		Keys:            db.NewAPIKeyRepo(pool),
-		Backends:        backendRepo,
-		Policies:        policyRepo,
-		DBPinger:        pgPinger{pool: pool},
-		RedisPinger:     redisPinger{client: rdb},
-		Selector:        selector,
-		Inference:       inferenceClient,
-		Circuit:         breaker,
-		Ledger:          ledger,
+		Logger:        logger,
+		Metrics:       m,
+		KeyHashSecret: cfg.AppKeyHashSecret,
+		AdminToken:    cfg.AdminToken,
+		Keys:          db.NewAPIKeyRepo(pool),
+		Backends:      backendRepo,
+		Policies:      policyRepo,
+		DBPinger:      pgPinger{pool: pool},
+		RedisPinger:   redisPinger{client: rdb},
+		Selector:      selector,
+		Inference:     inferenceClient,
+		Circuit:       breaker,
+		Ledger:        ledger,
+		Cache:         cache.New(rdb, time.Duration(cfg.CacheTTLSeconds)*time.Second),
+		Limiter:       ratelimit.New(rdb, cfg.RateLimitQPS, time.Second),
+		Idempotency: idempotency.NewCoordinator(db.NewIdempotencyRepo(pool),
+			time.Duration(cfg.IdempotencyTTLSeconds)*time.Second, idempotencyLockTTL),
 		InferenceBudget: cfg.InferenceBudget(),
 	})
 
 	return serve(ctx, logger, cfg.AppPort, handler)
 }
+
+// idempotencyLockTTL bounds how long a pending idempotency record blocks
+// same-key retries if its owner dies without completing. Twice the server
+// write deadline guarantees a live request — whose handler cannot outrun
+// that deadline — is never reclaimed mid-flight.
+const idempotencyLockTTL = 2 * config.ServerWriteTimeout
 
 // Async-ledger pool sizing: enough workers to keep up with normal completion
 // rates, a queue deep enough to ride out a brief Postgres stall before rows

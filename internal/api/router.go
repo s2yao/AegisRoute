@@ -10,7 +10,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/example/aegisroute/internal/auth"
+	"github.com/example/aegisroute/internal/cache"
 	"github.com/example/aegisroute/internal/httperror"
+	"github.com/example/aegisroute/internal/idempotency"
 	"github.com/example/aegisroute/internal/inference"
 	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
@@ -78,6 +80,31 @@ type InferenceRequestStore interface {
 	Insert(ctx context.Context, row models.InferenceRequest) (models.InferenceRequest, error)
 }
 
+// ResponseCache stores eligible completion responses. Get reports a miss as
+// (nil, nil); errors are for the handler to log and fail open on. Satisfied
+// by *cache.Cache.
+type ResponseCache interface {
+	Get(ctx context.Context, key string) (*cache.Entry, error)
+	Put(ctx context.Context, key string, e cache.Entry) error
+}
+
+// RateLimiter caps requests per API key. Errors are for the handler to fail
+// open on — a Redis outage degrades rate limiting, never availability.
+// Satisfied by *ratelimit.Limiter.
+type RateLimiter interface {
+	Allow(ctx context.Context, key string) (bool, error)
+}
+
+// IdempotencyGate drives the Idempotency-Key flow: Check before rate
+// limiting (completed replays are free), Begin after it (only admitted new
+// work opens a pending record), Complete with the final response. Satisfied
+// by *idempotency.Coordinator.
+type IdempotencyGate interface {
+	Check(ctx context.Context, scope, key, requestHash string) (idempotency.Decision, error)
+	Begin(ctx context.Context, scope, key, requestHash string) (idempotency.Decision, error)
+	Complete(ctx context.Context, recordID uuid.UUID, status int, headers map[string]string, body []byte) error
+}
+
 // Deps is everything NewRouter needs to wire the gateway. The composition root
 // (cmd/gateway-api) fills it from real repositories, pingers, and config; tests
 // fill it with fakes.
@@ -95,6 +122,9 @@ type Deps struct {
 	Inference     InferenceDoer
 	Circuit       CircuitReporter
 	Ledger        LedgerRecorder
+	Cache         ResponseCache
+	Limiter       RateLimiter
+	Idempotency   IdempotencyGate
 	// InferenceBudget caps the wall-clock time the chat handler spends across
 	// all failover attempts for one request; zero means no extra budget beyond
 	// the request context (used in tests). Production sets it from
@@ -129,10 +159,15 @@ func NewRouter(deps Deps) http.Handler {
 	r.Get("/readyz", readyz(deps))
 	r.Handle("/metrics", deps.Metrics.Handler())
 
-	// Bearer-authenticated tenant routes.
+	// Bearer-authenticated tenant routes. All of them share one per-API-key
+	// rate budget: /v1/models goes through the middleware, while the chat
+	// handler runs the same check inline at its precedence point — after the
+	// idempotency replay lookup (replays are free) and before a pending
+	// record is opened. Do not also wrap the chat route or requests would be
+	// charged twice.
 	r.Group(func(br chi.Router) {
 		br.Use(auth.BearerAuth(deps.KeyHashSecret, deps.Keys))
-		br.Get("/v1/models", listModels(deps))
+		br.With(rateLimitMiddleware(deps)).Get("/v1/models", listModels(deps))
 		br.Post("/v1/chat/completions", chatCompletions(deps))
 	})
 

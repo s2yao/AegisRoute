@@ -10,8 +10,8 @@ changes; do not duplicate `TODO.md`'s checklist items here.
 | 2 | Data layer | ✅ Done, committed | goose migrations, `internal/db` repos, `internal/redisstore` client, `internal/models` |
 | 3 | Gateway core | ✅ Done, committed | chi server, middleware chain, auth, health/ready, `/v1/models`, admin CRUD, seeder |
 | 4 | Sync inference | ✅ Done, committed | `cmd/mock-llm`, `internal/inference.Client`, `internal/routing.Selector` + `Breaker`, `POST /v1/chat/completions` |
-| 5 | Cache + idempotency + rate limiting | ⬜ Next | `internal/cache`, `internal/idempotency`, `internal/ratelimit`, `X-AegisRoute-Cache` header |
-| 6 | Batch jobs + control-worker | ⬜ Not started | `Queue` interface (`internal/jobs`), Redis Streams impl, `/api/v1/batch-jobs*`, `cmd/control-worker` |
+| 5 | Cache + idempotency + rate limiting | ✅ Done, **uncommitted** | `internal/cache`, `internal/idempotency` (+ `db.IdempotencyRepo`), `internal/ratelimit`, `X-AegisRoute-Cache` header, precedence note in `docs/design-decisions.md` |
+| 6 | Batch jobs + control-worker | ⬜ Next | `Queue` interface (`internal/jobs`), Redis Streams impl, `/api/v1/batch-jobs*`, `cmd/control-worker` |
 | 7 | Docker/Compose/Prometheus/E2E/CI | ⬜ Not started | Dockerfiles, `docker-compose.yml`, Prometheus scrape config, E2E script, CI, full README |
 
 **Definition of Done, every stage:** `gofmt -l .` empty, `go vet ./...`

@@ -15,7 +15,7 @@ Exactly three, forever (see `DECISIONS.md`):
 | `cmd/control-worker` | Consumes batch jobs from the Redis Stream with a bounded pool. **Stage 6, not yet implemented** (dir exists, empty). | `:9100` |
 | `cmd/mock-llm` | Deterministic fake OpenAI-compatible backend; content is a hash of the request body so identical input → identical output. Two instances run in Compose ("fast", "cheap"). | `:8081` / `:8082` |
 
-## Request flow (as of Stage 4)
+## Request flow (as of Stage 5)
 
 ```
 Client
@@ -24,12 +24,19 @@ Client
       → route-scoped auth (internal/auth): bearer for /v1/*, admin token for /api/v1/backends*, /api/v1/routing-policies*
       → handler
           /healthz, /readyz, /metrics            (public)
-          /v1/models                             (bearer)
-          /v1/chat/completions                   (bearer) → internal/routing.Selector.Select
-                                                            → internal/inference.Client.Do → mock-llm
-                                                            → internal/routing.Breaker (outcome report)
-                                                            → internal/db.InferenceRequestRepo.Insert (ledger)
+          /v1/models                             (bearer, rate-limited via middleware)
+          /v1/chat/completions                   (bearer) → read raw body once + hash
+                                                 → validate → idempotency Check (internal/idempotency)
+                                                 → rate limit (internal/ratelimit)
+                                                 → idempotency Begin → cache lookup (internal/cache)
+                                                 → internal/routing.Selector.Select
+                                                 → internal/inference.Client.Do → mock-llm
+                                                 → internal/routing.Breaker (outcome report)
+                                                 → cache store → async ledger (inference_requests)
+                                                 → idempotency Complete (every path)
           /api/v1/backends*, /api/v1/routing-policies*  (admin)
+
+  Exact precedence + rationale: docs/design-decisions.md
 ```
 
 ## `internal/` packages
@@ -66,11 +73,14 @@ do not build ahead of `TODO.md`'s active stage).
 
 **Gateway core (Stage 3)**
 - `internal/api` ✅ — the chi router (`NewRouter`), middleware chain, health
-  probes, `/v1/models`, admin CRUD for backends/routing-policies, and (as of
-  Stage 4) the chat-completions handler. Declares its own consumer-side
-  interfaces (`BackendStore`, `PolicyStore`, `Pinger`, `ChatSelector`,
-  `InferenceDoer`, `CircuitReporter`, `InferenceRequestStore`) so it never
-  imports `pgx` or a concrete routing/inference type directly.
+  probes, `/v1/models` (rate-limited), admin CRUD for
+  backends/routing-policies, and the chat-completions handler (as of Stage 5
+  with cache/idempotency/rate limiting in the exact order documented in
+  `docs/design-decisions.md`). Declares its own consumer-side interfaces
+  (`BackendStore`, `PolicyStore`, `Pinger`, `ChatSelector`, `InferenceDoer`,
+  `CircuitReporter`, `InferenceRequestStore`, `ResponseCache`, `RateLimiter`,
+  `IdempotencyGate`) so it never imports `pgx` or a concrete
+  routing/inference type directly.
 - `internal/auth` ✅ — `BearerAuth` (HMAC-SHA256 API-key lookup) and
   `AdminAuth` (constant-time token compare) middleware; `Principal` context
   helpers.
@@ -88,10 +98,20 @@ do not build ahead of `TODO.md`'s active stage).
   tie-break) and `Breaker` (the circuit breaker state machine). See
   `internal/routing/CLAUDE.md`.
 
-**Not yet built (Stage 5–7 — scaffolds only, doc.go describes intended role)**
-- `internal/cache` ⏳ — response cache, canonicalized cache keys.
-- `internal/idempotency` ⏳ — `Idempotency-Key` fast path.
-- `internal/ratelimit` ⏳ — per-key QPS limiter.
+**Request-path reliability (Stage 5)**
+- `internal/cache` ✅ — response cache for low-temperature completions:
+  `Eligible` (effective temperature ≤ 0.2; omitted → 1.0), `CanonicalBody`
+  (sorted keys, array order preserved), `Key` (sha256 over tenant/api-key
+  scope + canonical body), Redis entries with `CACHE_TTL_SECONDS`.
+- `internal/idempotency` ✅ — `Idempotency-Key` retry safety: `Classify`
+  (single semantics source), `IdempotencyStore` (satisfied by
+  `db.IdempotencyRepo`; Postgres authoritative), `Coordinator`
+  (Check/Begin/Complete), `Scope` (tenant+key+method+route — Stage 6 reuses
+  it). Precedence rules live in `docs/design-decisions.md`.
+- `internal/ratelimit` ✅ — per-API-key fixed window (`RATE_LIMIT_QPS`);
+  INCR + PEXPIRE in one atomic Lua invocation; callers fail open.
+
+**Not yet built (Stage 6–7 — scaffolds only, doc.go describes intended role)**
 - `internal/jobs` ⏳ — batch-job domain logic, status machine, the `Queue`
   interface (Redis Streams impl + in-memory fake). See
   `internal/jobs/CLAUDE.md` (also covers Redis Streams — there is no

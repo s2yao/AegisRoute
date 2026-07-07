@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/example/aegisroute/internal/config"
+	"github.com/example/aegisroute/internal/idempotency"
 	"github.com/example/aegisroute/internal/models"
 )
 
@@ -314,5 +316,76 @@ func TestIntegration(t *testing.T) {
 			RequestHash: "bad",
 		})
 		assert.Error(t, err, "the status CHECK constraint rejects unknown values")
+	})
+
+	t.Run("IdempotencyRepo", func(t *testing.T) {
+		repo := NewIdempotencyRepo(pool)
+		const (
+			scope = "tenant:t1:key:k1:POST:/v1/chat/completions"
+			hashA = "hash-a"
+			hashB = "hash-b"
+		)
+		ttl, lockTTL := time.Hour, time.Minute
+
+		// Absent → Begin inserts a pending record.
+		res, err := repo.Lookup(ctx, scope, "key-1", hashA)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.OutcomeAbsent, res.Outcome)
+
+		firstID, err := repo.Begin(ctx, scope, "key-1", hashA, ttl, lockTTL)
+		require.NoError(t, err)
+		assert.NotEqual(t, uuid.Nil, firstID)
+
+		// A live pending record: same body in-progress, different body conflict,
+		// and a concurrent Begin loses with ErrRecordActive.
+		res, err = repo.Lookup(ctx, scope, "key-1", hashA)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.OutcomeInProgress, res.Outcome)
+		res, err = repo.Lookup(ctx, scope, "key-1", hashB)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.OutcomeConflictBody, res.Outcome)
+		_, err = repo.Begin(ctx, scope, "key-1", hashA, ttl, lockTTL)
+		assert.ErrorIs(t, err, idempotency.ErrRecordActive,
+			"a live pending record must not be reclaimed")
+
+		// Complete → replay carries the stored response.
+		require.NoError(t, repo.Complete(ctx, firstID, 200,
+			[]byte(`{"Content-Type":"application/json"}`), []byte(`{"ok":true}`)))
+		res, err = repo.Lookup(ctx, scope, "key-1", hashA)
+		require.NoError(t, err)
+		require.Equal(t, idempotency.OutcomeReplay, res.Outcome)
+		require.NotNil(t, res.Record.ResponseStatus)
+		assert.Equal(t, 200, *res.Record.ResponseStatus)
+		assert.JSONEq(t, `{"ok":true}`, string(res.Record.ResponseBody))
+
+		// A completed record is held: Begin refuses, Complete refuses twice.
+		_, err = repo.Begin(ctx, scope, "key-1", hashA, ttl, lockTTL)
+		assert.ErrorIs(t, err, idempotency.ErrRecordActive)
+		err = repo.Complete(ctx, firstID, 500, nil, []byte(`{}`))
+		assert.ErrorIs(t, err, ErrNotFound, "completing a non-pending record must fail")
+
+		// Stale pending (lockTTL=0 → immediately reclaimable): Begin reclaims
+		// atomically and issues a fresh id; the dead owner's Complete fails.
+		staleID, err := repo.Begin(ctx, scope, "key-stale", hashA, ttl, 0)
+		require.NoError(t, err)
+		reclaimedID, err := repo.Begin(ctx, scope, "key-stale", hashB, ttl, lockTTL)
+		require.NoError(t, err, "a stale pending record is reclaimed")
+		assert.NotEqual(t, staleID, reclaimedID)
+		err = repo.Complete(ctx, staleID, 200, nil, []byte(`{}`))
+		assert.ErrorIs(t, err, ErrNotFound, "the superseded owner cannot complete")
+
+		// Expired record (ttl=0): treated as absent and reclaimed by Begin.
+		expiredID, err := repo.Begin(ctx, scope, "key-expired", hashA, 0, lockTTL)
+		require.NoError(t, err)
+		require.NoError(t, repo.Complete(ctx, expiredID, 200, nil, []byte(`{}`)))
+		res, err = repo.Lookup(ctx, scope, "key-expired", hashA)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.OutcomeAbsent, res.Outcome, "expired records are absent")
+		_, err = repo.Begin(ctx, scope, "key-expired", hashA, ttl, lockTTL)
+		assert.NoError(t, err, "an expired record is reclaimed by Begin")
+
+		// Scopes are isolated: the same key in another scope is independent.
+		_, err = repo.Begin(ctx, "tenant:t2:key:k2:POST:/v1/chat/completions", "key-1", hashA, ttl, lockTTL)
+		assert.NoError(t, err)
 	})
 }

@@ -102,6 +102,21 @@ substitutes. Each entry: the decision, then a one-sentence rationale.
 - **The circuit outcome report is panic-safe:** `callBackend` defers both the in-flight-slot `release()` and a "if not yet reported, `ReportCanceled`" cleanup, so a panic anywhere in the inference call frees the semaphore slot and releases the breaker's reserved half-open probe (verdict-free) before the recover middleware turns the panic into a 500 — a backend can never get stuck half-open un-probeable.
 - **`inference.Client` caps the response body at `MaxResponseBytes` (default 10 MiB via `io.LimitReader`)** — a backend streaming an unbounded or maliciously huge body is rejected as a permanent error (not retried, so no OOM-retry loop) instead of being read into memory unbounded.
 
+## Request-path reliability (Stage 5)
+
+The full precedence order and its rationale live in `docs/design-decisions.md`
+(the authoritative note). Locked decisions on top of it:
+
+- **Cache and idempotency are separate mechanisms with separate keys** — the cache keys on `sha256(tenant/api-key scope ‖ canonical parsed body)` (sorted object keys, array order preserved); idempotency keys on `(scope=tenant+key+method+route, Idempotency-Key)` and hashes the exact raw request bytes. Different `Idempotency-Key`s therefore never block a genuine cache HIT for the same canonical body.
+- **Omitted temperature normalizes to OpenAI's default 1.0 for cache eligibility, never Go's zero value** — omitted is NOT cacheable; explicit `0` is; the threshold is effective temperature ≤ 0.2 with `stream:false`. Only 2xx backend responses are stored.
+- **`idempotency.Classify` is the single source of record semantics** (expired → absent; body mismatch → conflict regardless of state; completed → replay; pending → in-progress while locked, stale after) — the Postgres repo and every test fake call it, so store implementations cannot drift.
+- **`Begin` is one atomic `INSERT … ON CONFLICT … DO UPDATE … WHERE` on the DB clock** — reclaiming expired/stale-pending rows and losing races in a single statement; the loser gets `ErrRecordActive` and folds back into replay/conflict via a re-lookup. Pending lock TTL = 2× `ServerWriteTimeout`, so a live request can never be reclaimed mid-flight, and a dead owner's `Complete` on a reclaimed record fails (`status='pending'` guard).
+- **Every response after `Begin` completes the record — including error envelopes** — a same-key retry replays the recorded outcome deterministically (Stripe-style). `X-Request-ID` is never stored and never replayed as a header; the replayed body keeps the original envelope's `request_id` field (it names the request that actually executed). The `Complete` write runs on a detached context (client disconnects cannot strand a pending record).
+- **No Redis fast path for idempotency in Stage 5** — Postgres is authoritative and sufficient; the spec's optional completed-record fast path can be added later behind the same `IdempotencyStore` interface without changing callers.
+- **The rate limiter is a Redis fixed window whose INCR and PEXPIRE happen in one Lua invocation** — a counter without an expiry (the classic INCR-then-crash bug, which would rate-limit a key forever) is unrepresentable. One budget per API key shared by all bearer routes: `/v1/models` via `rateLimitMiddleware`, the chat handler inline at its precedence point (never both on one route — that would double-charge).
+- **Fail-open vs fail-closed is deliberate per mechanism** — limiter and cache errors fail OPEN (degrade the feature, never availability); idempotency store errors fail CLOSED with 500 (guessing about replay correctness would break the exactly-once contract the client was promised).
+- **Chat ledger rows always carry `cache_result` (hit|miss|bypass) from Stage 5 on; HIT rows have `backend_id` NULL** — a hit called no backend; the row's `request_hash` stays the canonical-body hash (cache-aligned), distinct from the idempotency raw-bytes hash.
+
 ## Docker / compose (applies from Stage 7; integration checkpoints earlier)
 
 - **`docker compose` (v2, with a space), never `docker-compose`.**

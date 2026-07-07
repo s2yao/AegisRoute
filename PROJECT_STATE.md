@@ -55,12 +55,55 @@ flowchart LR
 1. **Foundations** (config, errors, logging, metrics scaffold) — ✅ **DONE** (`make verify` green)
 2. **Data layer** (migrations, db, redisstore, models, repos) — ✅ **DONE**
 3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
-4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE**, committed (`c38a2a6`)
-5. Cache + idempotency + rate limiting ← **NEXT**
-6. Batch jobs + Redis Streams + control-worker
+4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE**, committed (`c38a2a6` + polish `eed317c`)
+5. **Cache + idempotency + rate limiting** — ✅ **DONE** (implemented + DoD green; **uncommitted** — see "Current state")
+6. Batch jobs + Redis Streams + control-worker ← **NEXT**
 7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification
 
-## Current state (2026-07-05)
+## Current state (2026-07-06) — Stage 5 DONE, uncommitted
+
+Stage 5 is fully implemented and the Definition of Done is green
+(`gofmt -l .` empty; `go vet ./...`, `go build ./...`, `go test ./...` all
+pass Docker-free, also under `-race`), **deliberately uncommitted** per
+instruction. Commit with:
+
+```
+git commit -m "feat: response cache, idempotency, rate limiting on completion path"
+```
+
+What shipped:
+
+- `internal/cache` — eligibility (stream:false + effective temperature ≤ 0.2,
+  omitted → OpenAI default 1.0, explicit 0 cacheable), canonical body
+  (sorted keys, array order preserved), key = sha256(tenant/key scope ‖
+  canonical body), Redis entries (body + content type) with
+  CACHE_TTL_SECONDS; miniredis tests.
+- `internal/idempotency` — `Classify` (single semantics source),
+  `IdempotencyStore` (Lookup/Begin/Complete), `Coordinator`
+  (Check → rate limit → Begin → Complete), `Scope` (tenant+key+method+route,
+  reused by Stage 6); in-memory-fake tests.
+- `internal/db/idempotency_repo.go` — Postgres-authoritative store; atomic
+  INSERT … ON CONFLICT … WHERE reclaim of expired/stale-pending rows (DB
+  clock); integration subtest covers insert/conflict/reclaim/complete/expiry.
+- `internal/ratelimit` — Redis fixed-window per API key; INCR+PEXPIRE in one
+  Lua invocation (an orphaned counter without expiry is impossible);
+  miniredis + FastForward tests. Fail-open on Redis errors.
+- `internal/api` — chat handler reworked to the exact precedence (raw body
+  read once → raw-bytes hash → validate → idempotency Check → rate limit →
+  Begin → cache lookup → route/inference → cache store → ledger → Complete
+  on every path); `X-AegisRoute-Cache: HIT|MISS|BYPASS`; rate-limit
+  middleware on `GET /v1/models` (shared per-key budget, chat checks
+  inline); replay never reuses a stored X-Request-ID. Ledger rows now carry
+  `cache_result`; HIT rows have `backend_id` NULL.
+- `cmd/gateway-api` wiring (idempotency lock TTL = 2× ServerWriteTimeout);
+  `docs/design-decisions.md` (required precedence note + fail-open/closed
+  stances).
+
+Stage-5 tests: 11 handler-integration tests (miniredis + real
+cache/limiter/coordinator over an in-memory store), plus package tests for
+cache/idempotency/ratelimit and the db integration subtest.
+
+## Stage 4 state (2026-07-05)
 
 Stage 4 is fully implemented, committed as `c38a2a6` ("feat: mock-llm,
 inference client, routing, circuit breaker, chat completions"), and the
@@ -120,8 +163,8 @@ stage3's history, so it can be deleted.
 
 | Bucket | Contents |
 | --- | --- |
-| **Current stage (build now)** | Stages 1–4 COMPLETE and committed. Next session builds Stage 5 only: internal/cache, internal/idempotency, internal/ratelimit, miniredis-backed tests, X-AegisRoute-Cache header. |
-| **Future milestones (roadmap only)** | Stages 6–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
+| **Current stage (build now)** | Stages 1–5 COMPLETE (Stage 5 uncommitted). Next session builds Stage 6 only: Queue interface (internal/jobs) + Redis Streams impl + in-memory fake, /api/v1/batch-jobs* endpoints, cmd/control-worker. Read internal/jobs/CLAUDE.md first. |
+| **Future milestones (roadmap only)** | Stage 7. Do not create its source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
 | **Context only (never a build order)** | Architecture diagram, locked stack, ports table, demo credentials, Docker/compose notes, resume-positioning language. |
 | **Non-goals (entire MVP; mention only in docs/future-work.md)** | k6, Grafana dashboards, Kubernetes, Terraform, real model providers, OIDC, RBAC, SSE/streaming, gRPC, sqlc, global/distributed concurrency control. |
 

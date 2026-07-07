@@ -210,7 +210,8 @@ func TestChatCompletionsHappyPath(t *testing.T) {
 	assert.JSONEq(t, upstreamJSON, rec.Body.String(), "the backend's OpenAI JSON is returned as-is")
 	assert.Equal(t, "mock-llm-fast", rec.Header().Get("X-AegisRoute-Backend"))
 	assert.Equal(t, "default", rec.Header().Get("X-AegisRoute-Routing-Policy"))
-	assert.Empty(t, rec.Header().Get("X-AegisRoute-Cache"), "the cache header arrives in Stage 5, not before")
+	assert.Equal(t, "BYPASS", rec.Header().Get("X-AegisRoute-Cache"),
+		"no temperature → effective 1.0 → not cache-eligible → BYPASS")
 
 	assert.Equal(t, []string{"llama-fast"}, f.selector.calls)
 	assert.Equal(t, 1, f.selector.releaseCount(), "the in-flight slot is released exactly once")
@@ -247,7 +248,9 @@ func TestChatCompletionsPersistsLedgerRow(t *testing.T) {
 	assert.Equal(t, "llama-fast", row.Model)
 	require.NotNil(t, row.BackendID)
 	assert.Equal(t, f.backend.ID, *row.BackendID)
-	assert.Nil(t, row.CacheResult, "cache results do not exist until Stage 5")
+	require.NotNil(t, row.CacheResult)
+	assert.Equal(t, models.CacheResultBypass, *row.CacheResult,
+		"chat ledger rows always carry the cache result from Stage 5 on")
 	assert.GreaterOrEqual(t, row.LatencyMS, 0)
 	assert.Len(t, row.RequestHash, 64, "SHA-256 hex of the canonical body")
 	assert.NotEqual(t, uuid.Nil, row.TenantID)
