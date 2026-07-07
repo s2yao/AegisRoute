@@ -74,9 +74,14 @@ starts.
 - [x] Tests (Docker-free): pure status machine (all transitions + 3 aggregations); MemStore (tenant scoping, atomic concurrent claims never duplicate, exhaustion, terminal immutability, aggregation, outbox lifecycle); queue adapter over miniredis (publish→consume→ack, Consume-no-auto-ack + Claim recovers stranded via SetTime, DLQ stream, backlog before group); MemQueue fake; worker pool (concurrency peak ≤ limit, redelivery skips terminal items, Ack-after-durable-update via instrumented fakes, exhaustion→DLQ+job failed, partial-failure aggregation, outbox-drain retries then marks published); batch endpoints (persist+one publish, publish-failure keeps outbox pending, GET/items/list, idempotency replay, cross-tenant 404, validation matrix); JobRepo integration subtests (`//go:build integration`)
 - [x] Definition of Done: gofmt/vet/build/test all clean, Docker-free (also `-race` on worker/redisstore/jobs/api); `go build ./cmd/control-worker` green
 
-## Stage 7 — Docker/Compose/Prometheus/E2E/docs/CI
+## Stage 7 — Docker/Compose/Prometheus/E2E/docs/CI (DONE — MVP complete; uncommitted)
 
-- [ ] Dockerfiles + docker-compose.yml (postgres, redis, both mock-llms, gateway, worker, prometheus)
-- [ ] Prometheus scrape config; make dev-up/dev-down/logs/verify-e2e real
-- [ ] E2E verification script; GitHub Actions CI
-- [ ] Full README, docs/future-work.md; final verification
+- [x] Dockerfiles: `deploy/docker/{gateway-api,control-worker,mock-llm}.Dockerfile` — multi-stage, pinned `golang:1.25.11` build, static CGO-free binaries, `gcr.io/distroless/static-debian12:nonroot` final (non-root, no `:latest`); `.dockerignore` keeps the build context lean
+- [x] `docker-compose.yml`: postgres (`pg_isready` healthcheck + `pgdata` volume), redis (`redis-cli ping` healthcheck), gateway-api (auto-migrate + auto-seed, `depends_on` healthy PG/Redis, :8080), control-worker (:9100), mock-llm-fast (:8081) + mock-llm-cheap (:8082) both `llama-fast`, prometheus (:9090); service-name networking, no platform pins
+- [x] `observability/prometheus.yml`: scrape `gateway-api:8080` + `control-worker:9100`
+- [x] `scripts/e2e.sh`: `set -euo pipefail`, preflight (docker/curl/jq/go), cleanup trap (`down -v --remove-orphans`), clean-slate start, gofmt/vet/test gate, `up -d --build`, bounded readiness waits, chat MISS→HIT assertions, batch create → bounded terminal poll → items terminal, gateway+worker `aegisroute_*` metrics, live `go test -tags=integration ./...`; all waits time-bounded
+- [x] Makefile: real `dev-up`/`dev-down`/`logs`/`verify-e2e` (→ `bash scripts/e2e.sh`); `migrate-up`/`seed-dev` remained real from Stages 2–3
+- [x] `.github/workflows/ci.yml`: `unit` job (gofmt/vet/test, Docker-free) + `integration` job (postgres+redis services → migrate → `go test -tags=integration ./...`)
+- [x] `README.md`: overview, not-a-chatbot, not-a-thin-proxy, mermaid diagram, quickstart, LOCAL-ONLY creds, curl + cache-HIT + batch + metrics demos, Developer Operations, Assumptions & Tradeoffs, failure modes, resume link
+- [x] `docs/`: architecture.md, api.md, failure-modes.md, resume-bullets.md, future-work.md (non-MVP only; design-decisions.md already present)
+- [x] Definition of Done: gofmt/vet/test clean; `make verify-e2e` end-to-end (see PROJECT_STATE.md for live-run status)

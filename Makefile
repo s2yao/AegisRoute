@@ -42,17 +42,17 @@ migrate-up: ## Apply embedded DB migrations to DATABASE_URL
 seed-dev: ## Seed demo tenant, API key, and backends
 	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/gateway-api -seed
 
-dev-up: ## Start the full local stack via docker compose
-	@echo "not implemented until Stage 7"; exit 1
+dev-up: ## Start the full local stack via docker compose (build + detach)
+	docker compose up -d --build
 
-dev-down: ## Stop the local docker compose stack
-	@echo "not implemented until Stage 7"; exit 1
+dev-down: ## Stop the local stack and remove its volumes/orphans
+	docker compose down -v --remove-orphans
 
-logs: ## Tail docker compose logs
-	@echo "not implemented until Stage 7"; exit 1
+logs: ## Follow logs from all compose services
+	docker compose logs -f
 
-verify-e2e: ## Full end-to-end verification against the compose stack
-	@echo "not implemented until Stage 7"; exit 1
+verify-e2e: ## Full end-to-end verification against a fresh compose stack
+	bash scripts/e2e.sh
 
 clean: ## Remove build/test/coverage artifacts (never source)
 	go clean ./...

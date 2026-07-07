@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (gofmt + vet + test, Docker-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: gofmt (must be clean)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required for:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+
+  integration:
+    name: integration (real Postgres + Redis)
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://aegisroute:aegisroute@localhost:5432/aegisroute?sslmode=disable
+      REDIS_ADDR: localhost:6379
+      REDIS_DB: "0"
+      APP_KEY_HASH_SECRET: dev_only_change_me_32_bytes_minimum
+      DEV_API_KEY: sg_dev_key_123
+      ADMIN_TOKEN: dev_admin_token
+      STREAM_KEY: aegisroute:batch_jobs
+      STREAM_GROUP: aegisroute-workers
+      SEED_BACKEND_FAST_URL: http://localhost:8081
+      SEED_BACKEND_CHEAP_URL: http://localhost:8082
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: aegisroute
+          POSTGRES_PASSWORD: aegisroute
+          POSTGRES_DB: aegisroute
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aegisroute -d aegisroute"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Apply migrations
+        run: go run ./cmd/gateway-api -migrate
+      - name: Integration tests
+        run: go test -tags=integration -count=1 ./...

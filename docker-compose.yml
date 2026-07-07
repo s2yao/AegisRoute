@@ -1,0 +1,109 @@
+# AegisRoute local stack. `make dev-up` / `make verify-e2e` drive this.
+#
+# Networking: inside this file services reach each other by service name
+# (postgres:5432, redis:6379, mock-llm-fast:8081); the host reaches them on the
+# published ports (localhost:8080, :9100, :9090, ...). Do not "fix" one to
+# match the other — the split is deliberate (see DECISIONS.md).
+#
+# No `platform:` pins (every image here is multi-arch, so Apple Silicon runs
+# them natively) and no `:latest` tags.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aegisroute
+      POSTGRES_PASSWORD: aegisroute
+      POSTGRES_DB: aegisroute
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegisroute -d aegisroute"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  mock-llm-fast:
+    build:
+      context: .
+      dockerfile: deploy/docker/mock-llm.Dockerfile
+    environment:
+      MOCK_PORT: "8081"
+      MOCK_MODEL_NAME: "llama-fast"
+      MOCK_BACKEND_NAME: "mock-llm-fast"
+    ports:
+      - "8081:8081"
+
+  mock-llm-cheap:
+    build:
+      context: .
+      dockerfile: deploy/docker/mock-llm.Dockerfile
+    environment:
+      MOCK_PORT: "8082"
+      MOCK_MODEL_NAME: "llama-fast"
+      MOCK_BACKEND_NAME: "mock-llm-cheap"
+    ports:
+      - "8082:8082"
+
+  gateway-api:
+    build:
+      context: .
+      dockerfile: deploy/docker/gateway-api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://aegisroute:aegisroute@postgres:5432/aegisroute?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      APP_KEY_HASH_SECRET: "dev_only_change_me_32_bytes_minimum"
+      ADMIN_TOKEN: "dev_admin_token"
+      DEV_API_KEY: "sg_dev_key_123"
+      AEGISROUTE_AUTO_MIGRATE: "true"
+      AEGISROUTE_AUTO_SEED: "true"
+      SEED_BACKEND_FAST_URL: "http://mock-llm-fast:8081"
+      SEED_BACKEND_CHEAP_URL: "http://mock-llm-cheap:8082"
+    ports:
+      - "8080:8080"
+
+  control-worker:
+    build:
+      context: .
+      dockerfile: deploy/docker/control-worker.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://aegisroute:aegisroute@postgres:5432/aegisroute?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9100:9100"
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    depends_on:
+      - gateway-api
+      - control-worker
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+volumes:
+  pgdata:

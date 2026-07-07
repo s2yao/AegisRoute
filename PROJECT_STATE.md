@@ -57,20 +57,71 @@ flowchart LR
 3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
 4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE**, committed (`c38a2a6` + polish `eed317c`)
 5. **Cache + idempotency + rate limiting** — ✅ **DONE** (committed on branch)
-6. **Batch jobs + Redis Streams + control-worker** — ✅ **DONE** (implemented + DoD green; **uncommitted** — see "Current state")
-7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification ← **NEXT**
+6. **Batch jobs + Redis Streams + control-worker** — ✅ **DONE** (committed on branch)
+7. **Docker/Compose/Prometheus/E2E/README/docs/CI** — ✅ **DONE** (implemented; **uncommitted** — see "Current state")
 
-## Current state (2026-07-07) — Stage 6 DONE, uncommitted
+**PROJECT PHASE: COMPLETE.** All 7 stages implemented. Only `docs/future-work.md`
+items remain intentionally unbuilt.
 
-Stage 6 (the full asynchronous path) is implemented and the Definition of
-Done is green: `gofmt -l .` empty, `go vet ./...`, `go build ./...`,
-`go test ./...` all pass Docker-free (worker/redisstore/jobs/api also under
-`-race`), and `go build ./cmd/control-worker` builds. **Deliberately
-uncommitted** per instruction. Suggested commit:
+## Current state (2026-07-07) — Stage 7 DONE, MVP COMPLETE, uncommitted
+
+All 7 stages are implemented. The Docker-free gate is green (`gofmt -l .`
+empty, `go vet ./...`, `go build ./...`, `go test ./...`). **Deliberately
+uncommitted** per instruction. Suggested final commit:
 
 ```
-git commit -m "feat: batch jobs, redis streams queue, control-worker with bounded pool and DLQ"
+git commit -m "feat: docker compose, prometheus, e2e, docs, CI — MVP complete"
 ```
+
+What shipped (Stage 7 — package/run/verify/document):
+
+- **Dockerfiles** (`deploy/docker/{gateway-api,control-worker,mock-llm}.Dockerfile`)
+  — multi-stage, pinned `golang:1.25.11` build stage, static CGO-free binaries
+  (`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`), final stage on
+  `gcr.io/distroless/static-debian12:nonroot` (non-root, no `:latest`).
+  `.dockerignore` trims the build context.
+- **`docker-compose.yml`** — postgres (`pg_isready` healthcheck + `pgdata`
+  named volume), redis (`redis-cli ping` healthcheck), gateway-api (`:8080`,
+  `depends_on` healthy PG/Redis, `AEGISROUTE_AUTO_MIGRATE`/`AUTO_SEED=true`,
+  service-name `DATABASE_URL`/`REDIS_ADDR`, seed backend URLs),
+  control-worker (`:9100`, `ValidateForWorker` so it needs only DB+Redis),
+  mock-llm-fast (`:8081`) + mock-llm-cheap (`:8082`) both `MOCK_MODEL_NAME=llama-fast`,
+  prometheus (`:9090`). Service-name networking, no platform pins.
+- **`observability/prometheus.yml`** — scrapes `gateway-api:8080` and
+  `control-worker:9100`.
+- **`scripts/e2e.sh`** — `set -euo pipefail`; preflight for docker/curl/jq/go;
+  cleanup trap (`docker compose down -v --remove-orphans`); clean-slate start;
+  gofmt/vet/test gate; `up -d --build`; **bounded** readiness waits
+  (30×2s = 60s cap) for `/readyz` + `/healthz`; chat MISS then HIT (distinct
+  idempotency keys); batch create → **bounded** terminal poll (30×2s) → both
+  items terminal; gateway + worker `aegisroute_*` metrics; live
+  `go test -tags=integration ./...` with the host-side env exported. Every
+  wait is time-bounded.
+- **Makefile** — real `dev-up` (`up -d --build`), `dev-down`
+  (`down -v --remove-orphans`), `logs` (`logs -f`), `verify-e2e`
+  (`bash scripts/e2e.sh`).
+- **`.github/workflows/ci.yml`** — `unit` (gofmt/vet/test, Docker-free) +
+  `integration` (postgres+redis service containers → `-migrate` →
+  `go test -tags=integration ./...`), Go 1.25, module cache.
+- **`README.md`** — full: overview, not-a-chatbot, not-a-thin-proxy, mermaid
+  diagram, quickstart, LOCAL-ONLY creds, curl + cache-HIT + batch + metrics
+  demos, Developer Operations, Assumptions & Tradeoffs, failure modes.
+- **`docs/`** — architecture.md, api.md, failure-modes.md, resume-bullets.md,
+  future-work.md (non-MVP items only; `XAUTOCLAIM` is NOT listed as future work
+  — it's already used).
+
+**`make verify-e2e` live-run status: PASSED (2026-07-07, Docker 29.6.1 /
+Compose v2).** Ran the full script end to end: all five pinned base images
+pull (`golang:1.25.11`, `gcr.io/distroless/static-debian12:nonroot`,
+`prom/prometheus:v3.1.0`, `postgres:17-alpine`, `redis:7-alpine`); postgres +
+redis reach healthy; gateway `/readyz` and worker `/healthz` up on attempt 1;
+sync chat #1 → `X-AegisRoute-Cache: MISS`, #2 (new key, same body) → `HIT`;
+batch job reached `succeeded` with both items terminal; both processes export
+`aegisroute_*`; live `go test -tags=integration ./...` all PASS; cleanup trap
+tore the stack down (verified no leftover containers). The Docker-free gate
+(`gofmt`/`vet`/`build`/`test`) is also green.
+
+## Prior state (2026-07-07) — Stage 6 DONE (committed `e65a64b`)
 
 What shipped (Stage 6):
 
