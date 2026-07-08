@@ -251,8 +251,10 @@ Logs: `make logs` (or `docker compose logs -f <service>`). Metrics: the
 
 ## Assumptions & Tradeoffs
 
-- `go.mod` declares `go 1.25`; the local toolchain may be newer — the directive,
-  not the installed toolchain, is the compatibility contract.
+- `go.mod` declares `go 1.25.7`; the local toolchain may be newer — the
+  directive, not the installed toolchain, is the compatibility contract. The
+  Docker build pins `golang:1.25.11` (a patch ≥ the directive), so the image
+  builds without downloading a newer toolchain.
 - Module path is `github.com/example/aegisroute` until published; rename with
   `go mod edit -module github.com/<you>/aegisroute && go mod tidy`.
 - `go test ./...` requires **no** Docker, Postgres, or Redis — ever. Real-infra

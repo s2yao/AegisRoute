@@ -119,7 +119,40 @@ sync chat #1 → `X-AegisRoute-Cache: MISS`, #2 (new key, same body) → `HIT`;
 batch job reached `succeeded` with both items terminal; both processes export
 `aegisroute_*`; live `go test -tags=integration ./...` all PASS; cleanup trap
 tore the stack down (verified no leftover containers). The Docker-free gate
-(`gofmt`/`vet`/`build`/`test`) is also green.
+(`gofmt`/`vet`/`build`/`test`) is also green. Separately verified Prometheus
+scrapes both targets `health=up` and ingests the `aegisroute_*` series.
+
+### Post-Stage-7 verification pass (2 runs) — 3 fixes (uncommitted)
+
+Two verification passes over the packaging/ops/docs artifacts and the packaged
+dataflow. No unusable-level defect (the stack builds, runs, and the full E2E
+passes), but one Major flakiness bug:
+
+1. **MAJOR — e2e integration step raced the live worker:** step (l) ran
+   `go test -tags=integration ./...` while the `control-worker` container was
+   up. `JobRepo.PendingOutbox` has no tenant filter, so the worker's 5s
+   outbox-drain published the integration tests' freshly-created jobs and its
+   consume loop then claimed those items — racing the tests' own
+   `PendingOutbox`/`ClaimNextQueuedItem` assertions (~10% flaky-failure
+   window; it passed the first run by timing luck). Fix: `scripts/e2e.sh` now
+   `docker compose stop control-worker` before the integration step (those
+   tests exercise the data layer against live Postgres+Redis; the worker is
+   not under test and the stores stay up).
+2. **OTHER — e2e batch poll could abort on a transient blip:** the poll's
+   `status="$(curl -fsS … | jq …)"` under `set -euo pipefail` would exit the
+   whole run on one transient curl/jq failure instead of retrying within the
+   bounded loop. Fix: `… 2>/dev/null | jq … 2>/dev/null || true` so the bounded
+   loop keeps polling.
+3. **MINOR — README version accuracy:** README said go.mod declares `go 1.25`;
+   it declares `go 1.25.7`. Corrected, with a note that the pinned
+   `golang:1.25.11` build image is a patch ≥ the directive (no toolchain
+   download).
+
+Verified-correct (no change): `golang:1.25.11` satisfies `go 1.25.7` and builds
+with a local-only toolchain (no forced download); all five pinned images pull;
+`docker compose config` valid; `promtool check config` passes; CI YAML parses;
+Prometheus scrapes both processes `up`; doc claims (status codes, routing,
+fail-open/closed) match the code. Files touched: `scripts/e2e.sh`, `README.md`.
 
 ## Prior state (2026-07-07) — Stage 6 DONE (committed `e65a64b`)
 

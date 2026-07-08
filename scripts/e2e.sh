@@ -122,8 +122,10 @@ ok "created batch job $JOB_ID"
 say "polling batch job until terminal (cap ~60s)"
 status=""
 for ((i = 1; i <= BATCH_ATTEMPTS; i++)); do
+  # Tolerate a transient curl/jq hiccup mid-poll: `|| true` keeps the bounded
+  # loop retrying instead of aborting the whole run under `set -euo pipefail`.
   status="$(curl -fsS -H "Authorization: Bearer $API_KEY" \
-    "$GATEWAY/api/v1/batch-jobs/$JOB_ID" | jq -r '.status')"
+    "$GATEWAY/api/v1/batch-jobs/$JOB_ID" 2>/dev/null | jq -r '.status' 2>/dev/null || true)"
   case "$status" in
     succeeded | partially_failed | failed)
       ok "batch job reached terminal status '$status' (attempt $i)"
@@ -151,6 +153,14 @@ curl -sf "$WORKER/metrics"  | grep -q "aegisroute_" || fail "no aegisroute_ metr
 ok "both processes export aegisroute_* metrics"
 
 # --- (l) integration tests against the live stores ------------------------
+# Stop the worker first: its outbox-drain and consume loops would otherwise
+# publish and process the integration tests' freshly-created jobs (PendingOutbox
+# has no tenant filter), racing those tests' own outbox/claim assertions. The
+# integration tests exercise the data layer against live Postgres + Redis — the
+# stores stay up; only the worker (which is not under test here) is paused.
+say "pausing control-worker so it can't race the integration tests"
+docker compose stop control-worker >/dev/null 2>&1 || true
+
 say "integration tests against the live stack (go test -tags=integration ./...)"
 export DATABASE_URL="postgres://aegisroute:aegisroute@localhost:5432/aegisroute?sslmode=disable"
 export REDIS_ADDR="localhost:6379"
