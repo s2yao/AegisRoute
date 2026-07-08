@@ -118,6 +118,10 @@ func (s *MemStore) Items(_ context.Context, tenantID, jobID uuid.UUID) ([]models
 	for _, it := range stored {
 		out = append(out, *it)
 	}
+	// Mirror JobRepo.Items: return items in a deterministic order by custom_id
+	// (unique within a job), so fake-backed tests observe the same ordering
+	// contract as the Postgres store.
+	sort.Slice(out, func(i, j int) bool { return out[i].CustomID < out[j].CustomID })
 	return out, nil
 }
 

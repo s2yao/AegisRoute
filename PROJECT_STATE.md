@@ -100,6 +100,33 @@ served via failover** to mock-llm-cheap. `docs/benchmarks.md` +
 `internal/routing/selector.go`, both `cmd/*/main.go`, `DECISIONS.md`,
 `docker-compose.bench.yml`, `scripts/bench.sh`, `Makefile`, `docs/`.
 
+### Post-Stage-8 verification pass (3 e2e runs, 2026-07-08) — 1 fix (uncommitted)
+
+Three full `scripts/e2e.sh` runs (plus a metrics-capture bring-up) to validate
+the packaged dataflow. Runs #1 and #2 passed; **run #3 failed intermittently**
+at the live-integration step — the one Major bug this surfaced:
+
+1. **MAJOR — non-deterministic batch-item ordering (flaky test + wrong API
+   order):** `JobRepo.Items` ordered by `created_at ASC, id ASC`, but every item
+   of a batch is inserted in one transaction, so they share a `created_at` and
+   the effective sort fell through to the random `gen_random_uuid()` `id`.
+   Consequences: (a) `GET /api/v1/batch-jobs/{id}/items` returned a batch's items
+   in a different order on every request, and (b) `TestIntegration/JobRepo`
+   (`assert items[0].CustomID == "a"`) flaked. Reproduced **15/40** failures on
+   the old query. Fix: order by `custom_id ASC` — `custom_id` is UNIQUE per job
+   (`uq_batch_job_items_job_custom`), so it is a total, deterministic order, and
+   the read is now served straight from that index with no sort step.
+   `internal/jobs/memstore.go` sorts its `Items` by `custom_id` to mirror the DB
+   contract (so the fake can't drift from Postgres again), and the integration
+   test now asserts the full `[a, b]` order.
+
+Verified: `make verify` green; the `JobRepo` integration test looped **40/40**
+after the fix (was 15/40 failing before); full `go test -tags=integration ./...`
+green ×3; a fourth full `scripts/e2e.sh` run PASSED end to end (chat MISS→HIT,
+batch succeeded with both items terminal, both processes export `aegisroute_*`,
+live integration step green). Files touched: `internal/db/job_repo.go`,
+`internal/db/integration_test.go`, `internal/jobs/memstore.go`.
+
 ## Current state (2026-07-07) — Stage 7 DONE, MVP COMPLETE, uncommitted
 
 All 7 stages are implemented. The Docker-free gate is green (`gofmt -l .`

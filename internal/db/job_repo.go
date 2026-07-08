@@ -126,8 +126,11 @@ func (r *JobRepo) List(ctx context.Context, tenantID uuid.UUID) ([]models.BatchJ
 	return out, nil
 }
 
-// Items returns the items of the tenant's job in creation order, or
-// jobs.ErrNotFound when the job does not exist for that tenant.
+// Items returns the items of the tenant's job ordered by custom_id, or
+// jobs.ErrNotFound when the job does not exist for that tenant. custom_id is
+// unique within a job, so it is a total, deterministic order; created_at is
+// not a usable sort key here because every item of a batch is inserted in one
+// transaction and thus shares a created_at, and the uuid id is random.
 func (r *JobRepo) Items(ctx context.Context, tenantID, jobID uuid.UUID) ([]models.BatchJobItem, error) {
 	// Ownership is checked explicitly (not just via the join) so an empty
 	// result can still distinguish "job not yours/missing" from "no items".
@@ -138,7 +141,7 @@ func (r *JobRepo) Items(ctx context.Context, tenantID, jobID uuid.UUID) ([]model
 		SELECT `+batchItemColumns+`
 		FROM batch_job_items
 		WHERE job_id = $1
-		ORDER BY created_at ASC, id ASC`,
+		ORDER BY custom_id ASC`,
 		jobID)
 	if err != nil {
 		return nil, fmt.Errorf("db: list batch job items: %w", err)

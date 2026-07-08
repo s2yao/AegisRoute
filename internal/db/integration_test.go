@@ -446,7 +446,11 @@ func TestIntegration(t *testing.T) {
 		items, err := repo.Items(ctx, tenant.ID, job.ID)
 		require.NoError(t, err)
 		require.Len(t, items, 2)
+		// Items come back in a deterministic custom_id order: both share a
+		// created_at (inserted in one transaction), so the order is stable
+		// across runs, not dependent on the random uuid id.
 		assert.Equal(t, "a", items[0].CustomID)
+		assert.Equal(t, "b", items[1].CustomID)
 
 		// MarkJobRunning is idempotent: queued→running once, then a no-op.
 		require.NoError(t, repo.MarkJobRunning(ctx, job.ID))
