@@ -182,6 +182,12 @@ func (c *Client) Do(ctx context.Context, backend models.ModelBackend, body []byt
 				// verdict, so the error is deliberately non-transient.
 				return nil, &Error{Backend: backend.Name, Transient: false, Err: err}
 			}
+			// A retry attempt (the 2nd+ try after a transient failure) is now
+			// actually being made — count it so the reliability story is a
+			// provable counter, not just the point-in-time breaker gauge.
+			if c.metrics != nil {
+				c.metrics.BackendRetriesTotal.WithLabelValues(backend.Name).Inc()
+			}
 		}
 
 		resp, err := c.attempt(ctx, backend, url, body)

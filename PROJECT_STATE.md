@@ -60,8 +60,45 @@ flowchart LR
 6. **Batch jobs + Redis Streams + control-worker** — ✅ **DONE** (committed on branch)
 7. **Docker/Compose/Prometheus/E2E/README/docs/CI** — ✅ **DONE** (implemented; **uncommitted** — see "Current state")
 
-**PROJECT PHASE: COMPLETE.** All 7 stages implemented. Only `docs/future-work.md`
+**PROJECT PHASE: COMPLETE.** All 7 stages implemented. A post-MVP **Stage 8**
+(observability patches + load benchmark) is also done. Only `docs/future-work.md`
 items remain intentionally unbuilt.
+
+## Stage 8 — observability + benchmark (2026-07-08, post-MVP, uncommitted)
+
+Additive only; no feature behavior changed. Metric set grew 10 → **15**
+`aegisroute_*` collectors:
+
+- **Patch A** — fine latency buckets (down to 0.5ms) on the HTTP + backend
+  duration histograms, so p95/p99 on a sub-ms-cache gateway reads accurately.
+- **Patch B** — `aegisroute_chat_completion_duration_seconds{cache}` histogram,
+  observed in the chat handler via a top-of-handler timer + `chatOutcome`
+  (hit|miss|bypass), so HIT vs BYPASS latency is readable straight from metrics.
+- **Patch C** — reliability counters: `aegisroute_backend_retries_total`
+  (inference retry loop), `aegisroute_circuit_breaker_short_circuits_total`
+  (selector skips an open circuit), `aegisroute_circuit_breaker_transitions_total{to}`
+  (breaker state listener).
+- **Patch D** — `aegisroute_backend_in_flight` gauge on the selector semaphore
+  (inc on select, dec in the `sync.Once` release).
+- Wired `routing.WithMetrics(m)` into both cmd mains; DECISIONS.md table +
+  `internal/routing/CLAUDE.md`-consistent. Tests green incl. `-race`.
+
+Benchmark: `docker-compose.bench.yml` (rate limit off, ~40ms mock backend) +
+`scripts/bench.sh` (`make bench`) using **hey** (external dev tool — still three
+binaries; no `cmd/` load generator). It runs uncached-BYPASS vs cached-HIT `hey`
+profiles, chunked batch throughput (API caps 100 items/batch, so 200 items = 2
+batches), Prometheus PromQL extraction, and rate-limit + circuit-breaker demos;
+writes `docs/benchmarks.md`.
+
+**`make bench` live-run (2026-07-08, Apple M2, 8 cores): PASSED.** Cache p95
+≈48ms→8ms (**5.8×**), throughput ≈1.1k→11.6k rps (**10.4×**), hit ratio 0.9999;
+batch 200 items→succeeded in ~2s (~6000 items/min); rate-limit 45/50→429;
+circuit breaker opened (state=2), 180 short-circuits, 40 retries, **200/200
+served via failover** to mock-llm-cheap. `docs/benchmarks.md` +
+`docs/resume-bullets.md` carry the real numbers. Files touched:
+`internal/metrics`, `internal/api/chat.go`, `internal/inference/client.go`,
+`internal/routing/selector.go`, both `cmd/*/main.go`, `DECISIONS.md`,
+`docker-compose.bench.yml`, `scripts/bench.sh`, `Makefile`, `docs/`.
 
 ## Current state (2026-07-07) — Stage 7 DONE, MVP COMPLETE, uncommitted
 

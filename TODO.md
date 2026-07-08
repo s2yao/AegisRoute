@@ -85,3 +85,15 @@ starts.
 - [x] `README.md`: overview, not-a-chatbot, not-a-thin-proxy, mermaid diagram, quickstart, LOCAL-ONLY creds, curl + cache-HIT + batch + metrics demos, Developer Operations, Assumptions & Tradeoffs, failure modes, resume link
 - [x] `docs/`: architecture.md, api.md, failure-modes.md, resume-bullets.md, future-work.md (non-MVP only; design-decisions.md already present)
 - [x] Definition of Done: gofmt/vet/test clean; `make verify-e2e` end-to-end (see PROJECT_STATE.md for live-run status)
+
+## Stage 8 — Observability patches + load benchmark (DONE — post-MVP; uncommitted)
+
+- [x] Patch A: fine-grained latency histogram buckets (down to 0.5ms) on `aegisroute_http_request_duration_seconds` + `aegisroute_backend_request_duration_seconds` (`internal/metrics`)
+- [x] Patch B: `aegisroute_chat_completion_duration_seconds{cache}` histogram observed in the chat handler (hit|miss|bypass) via a top-of-handler timer + `chatOutcome`
+- [x] Patch C: `aegisroute_backend_retries_total{backend}` (inference retry loop), `aegisroute_circuit_breaker_short_circuits_total{backend}` (selector skips open circuit), `aegisroute_circuit_breaker_transitions_total{backend,to}` (breaker state listener)
+- [x] Patch D: `aegisroute_backend_in_flight{backend}` gauge on the selector semaphore (inc on select, dec in release, sync.Once-balanced)
+- [x] Wired `routing.WithMetrics(m)` into both cmd mains + transitions counter in the breaker listener; DECISIONS.md metric table updated (10 → 15 metrics); tests green incl. -race
+- [x] `docker-compose.bench.yml` overlay (rate limit effectively off, ~40ms backend latency; env-substitutable for the rate-limit + circuit-breaker phases)
+- [x] `scripts/bench.sh` (`make bench`): hey profiles (uncached BYPASS vs cached HIT), batch throughput (chunked ≤100/batch), Prometheus PromQL extraction, rate-limit demo, circuit-breaker demo; writes `docs/benchmarks.md`; bounded waits; cleanup trap
+- [x] `docs/benchmarks.md` (real numbers + environment caveats) and `docs/resume-bullets.md` (populated with measured numbers)
+- [x] Definition of Done: gofmt/vet/build/test clean (unchanged, Docker-free); `make bench` PASSED live — cache p95 5.8× / throughput 10.4×, ~6000 items/min batch, breaker 200/200 via failover, 45/50 rate-limited

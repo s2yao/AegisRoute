@@ -69,7 +69,13 @@ substitutes. Each entry: the decision, then a one-sentence rationale.
 | `BatchItemsProcessedTotal` | `aegisroute_batch_items_processed_total` | counter; `outcome` |
 | `WorkerFailuresTotal` | `aegisroute_worker_failures_total` | counter |
 | `CircuitBreakerState` | `aegisroute_circuit_breaker_state` | gauge; `backend` |
+| `ChatCompletionDurationSeconds` | `aegisroute_chat_completion_duration_seconds` | histogram; `cache` (hit\|miss\|bypass) |
+| `BackendRetriesTotal` | `aegisroute_backend_retries_total` | counter; `backend` |
+| `CircuitShortCircuitsTotal` | `aegisroute_circuit_breaker_short_circuits_total` | counter; `backend` |
+| `CircuitBreakerTransitionsTotal` | `aegisroute_circuit_breaker_transitions_total` | counter; `backend,to` |
+| `BackendInFlight` | `aegisroute_backend_in_flight` | gauge; `backend` |
 
+- **The last five (Stage 8, observability) are additive** — same non-global registry, same naming rule. `HTTPRequestDurationSeconds`, `BackendRequestDurationSeconds`, and `ChatCompletionDurationSeconds` use fine-grained buckets (down to 0.5ms) rather than `prometheus.DefBuckets`, so p95/p99 on a low-latency gateway (sub-ms cache HITs) reads accurately. `ChatCompletionDurationSeconds` is a **separate** histogram from the global HTTP one because only the completion handler knows the cache outcome; the middleware that sets the global histogram does not.
 - **The `route` label is always the chi route pattern, never the raw path** — bounded label cardinality. HTTP response headers keep conventional `X-Capitalized` form; only metric names are lowercased.
 
 ## Gateway core (Stage 3)

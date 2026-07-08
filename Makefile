@@ -10,7 +10,7 @@ SHELL := /bin/sh
 .DEFAULT_GOAL := help
 
 .PHONY: help fmt vet test verify test-integration migrate-up seed-dev \
-	dev-up dev-down logs verify-e2e clean
+	dev-up dev-down logs verify-e2e bench clean
 
 help: ## List all targets with descriptions
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -53,6 +53,9 @@ logs: ## Follow logs from all compose services
 
 verify-e2e: ## Full end-to-end verification against a fresh compose stack
 	bash scripts/e2e.sh
+
+bench: ## Load benchmark: bench stack, hey profiles, PromQL, writes docs/benchmarks.md
+	bash scripts/bench.sh
 
 clean: ## Remove build/test/coverage artifacts (never source)
 	go clean ./...

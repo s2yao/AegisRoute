@@ -10,7 +10,32 @@ Redis) that fronts OpenAI-compatible model backends with auth, policy-based
 routing, circuit breaking, response caching, request idempotency, per-key rate
 limiting, and a durable at-least-once batch pipeline — all covered by a
 Docker-free test suite plus an integration tier and a one-command end-to-end
-verification.
+verification. A local load benchmark measures a **~5.8× p95 latency reduction
+and ~10× throughput gain** on cache hits, and **200/200 requests still served
+via failover** when a backend is forced to fail.
+
+## Measured performance
+
+Numbers from `make bench` on a single machine (Apple M2, 8 cores) — a local
+Docker Compose benchmark with `hey`, cache on, a simulated 40ms backend, and
+the rate limiter raised for the throughput run. Full method + caveats in
+[benchmarks.md](benchmarks.md) (these are honest control-plane numbers; the
+"backend" is a deterministic mock, not a real LLM).
+
+- **Cache: ~5.8× lower p95 latency** (BYPASS p95 ≈ 48ms → HIT p95 ≈ 8ms) and
+  **~10× higher throughput** (≈ 1.1k → ≈ 11.6k req/s at c=50), hit ratio 0.9999.
+- **Batch: ~6,000 items/min** processed end-to-end (200 items to terminal in ~2s
+  through the bounded worker pool against a 40ms backend).
+- **Circuit breaker: 200/200 requests succeeded** with the primary backend
+  forced to fail — the breaker opened after 5 consecutive transient failures,
+  short-circuited ~180 subsequent calls to it, and every request was failed over
+  to the healthy backend.
+- **Rate limit: 45/50 rapid requests correctly rejected with 429** at a 5 QPS
+  per-key limit, all counted in `aegisroute_rate_limited_total`.
+- Every headline number is also readable from Prometheus (`histogram_quantile`
+  over the fine-bucketed histograms, cache-labeled completion latency, the cache
+  hit ratio, and the reliability counters), so the claims are instrumented, not
+  just client-side.
 
 ## Bullets
 
@@ -54,10 +79,15 @@ verification.
   one-command **`make verify-e2e`** that stands up the full Compose stack, proves
   MISS→HIT and a batch to terminal, checks metrics, runs integration tests, and
   tears down — all with time-bounded waits.
-- Instrumented everything with a fixed `aegisroute_*` Prometheus set on a
-  non-global registry (no accidental double-registration, small deterministic
-  `/metrics`), structured `slog` JSON logs with a single redaction gate, and an
-  `X-Request-ID` on every response.
+- Instrumented everything with a fixed **15-metric `aegisroute_*` Prometheus
+  set** on a non-global registry (no accidental double-registration, small
+  deterministic `/metrics`): request/backend/completion latency histograms with
+  **fine buckets** tuned for a sub-ms-cache gateway, a cache-labeled completion
+  histogram (HIT vs BYPASS latency straight from metrics), and reliability
+  counters that turn point-in-time gauges into provable claims — backend
+  retries, circuit short-circuits, breaker transitions, and a per-backend
+  in-flight gauge. Plus structured `slog` JSON logs with a single redaction gate
+  and an `X-Request-ID` on every response.
 
 ## What I would do next (see future-work.md)
 

@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/example/aegisroute/internal/db"
+	"github.com/example/aegisroute/internal/metrics"
 	"github.com/example/aegisroute/internal/models"
 )
 
@@ -68,6 +69,7 @@ type Selector struct {
 	backends BackendStore
 	policies PolicyStore
 	breaker  *Breaker
+	metrics  *metrics.Metrics // optional; nil disables selector instrumentation
 
 	mu   sync.Mutex // guards rng and sems
 	rng  *rand.Rand
@@ -81,6 +83,13 @@ type SelectorOption func(*Selector)
 // tests can make selection order deterministic with a seeded source.
 func WithRandSource(src rand.Source) SelectorOption {
 	return func(s *Selector) { s.rng = rand.New(src) }
+}
+
+// WithMetrics wires observability into the Selector: the per-backend in-flight
+// gauge and the open-circuit short-circuit counter. Optional — nil (the
+// default) leaves the Selector uninstrumented, which is what unit tests use.
+func WithMetrics(m *metrics.Metrics) SelectorOption {
+	return func(s *Selector) { s.metrics = m }
 }
 
 // NewSelector builds a Selector over the given stores and circuit breaker.
@@ -158,11 +167,20 @@ func (s *Selector) Select(ctx context.Context, model string, exclude ...uuid.UUI
 		// the single half-open probe slot, so it must only be consumed by a
 		// candidate that already holds capacity to actually make the call.
 		if !s.breaker.Allow(b.Name) {
+			// Skipped because the circuit is open (or its half-open probe is
+			// already taken): a provable reliability event, not just the gauge.
+			s.observeShortCircuit(b.Name)
 			sem.release()
 			continue
 		}
+		s.observeInFlight(b.Name, 1)
 		var once sync.Once
-		release := func() { once.Do(sem.release) }
+		release := func() {
+			once.Do(func() {
+				sem.release()
+				s.observeInFlight(b.Name, -1)
+			})
+		}
 		return Selection{Backend: b, PolicyName: policyName, Strategy: strategy}, release, nil
 	}
 	return Selection{}, nil, ErrNoCapacity
@@ -233,6 +251,21 @@ func (s *Selector) semaphoreFor(b models.ModelBackend) *semaphore {
 		s.sems[b.ID] = sem
 	}
 	return sem
+}
+
+// observeShortCircuit counts a candidate skipped because its circuit was open.
+func (s *Selector) observeShortCircuit(backend string) {
+	if s.metrics != nil {
+		s.metrics.CircuitShortCircuitsTotal.WithLabelValues(backend).Inc()
+	}
+}
+
+// observeInFlight moves the per-backend in-flight gauge by delta (+1 on
+// selection, -1 on release), balanced by the release func's sync.Once.
+func (s *Selector) observeInFlight(backend string, delta float64) {
+	if s.metrics != nil {
+		s.metrics.BackendInFlight.WithLabelValues(backend).Add(delta)
+	}
 }
 
 // InFlight reports how many requests currently hold a slot for the backend

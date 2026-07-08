@@ -326,6 +326,17 @@ func cacheRequest(req *ChatRequest) cache.Request {
 // success, cache hit, or error — completes it.
 func chatCompletions(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Cache-labeled end-to-end latency: the global HTTP histogram (set by
+		// middleware) can't see the cache outcome, so a dedicated histogram
+		// here makes HIT-path vs MISS/BYPASS-path latency readable straight
+		// from metrics. chatOutcome defaults to bypass (no cache consulted) and
+		// is set to the real result at the cache decision below.
+		start := time.Now()
+		chatOutcome := models.CacheResultBypass
+		defer func() {
+			deps.Metrics.ChatCompletionDurationSeconds.WithLabelValues(chatOutcome).Observe(time.Since(start).Seconds())
+		}()
+
 		principal, ok := auth.PrincipalFromContext(r.Context())
 		if !ok {
 			// Unreachable behind BearerAuth; guards against a future wiring bug.
@@ -429,6 +440,7 @@ func chatCompletions(deps Deps) http.HandlerFunc {
 				deps.Logger.Warn("cache lookup failed; treating as miss", "error", err)
 				cacheResult = models.CacheResultMiss
 			case entry != nil:
+				chatOutcome = models.CacheResultHit
 				deps.Metrics.CacheEventsTotal.WithLabelValues(models.CacheResultHit).Inc()
 				// HIT: no backend call. The ledger row records the hit with a
 				// null backend; the response reuses only the stored body and
@@ -445,6 +457,7 @@ func chatCompletions(deps Deps) http.HandlerFunc {
 				cacheResult = models.CacheResultMiss
 			}
 		}
+		chatOutcome = cacheResult
 		deps.Metrics.CacheEventsTotal.WithLabelValues(cacheResult).Inc()
 
 		// Route → inference with intra-request failover, bounded by the

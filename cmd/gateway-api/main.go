@@ -162,9 +162,10 @@ func runServe(ctx context.Context) error {
 		time.Duration(cfg.CBCooldownMS)*time.Millisecond,
 		routing.WithStateListener(func(backend string, state models.CircuitState) {
 			m.CircuitBreakerState.WithLabelValues(backend).Set(routing.CircuitStateGaugeValue(state))
+			m.CircuitBreakerTransitionsTotal.WithLabelValues(backend, string(state)).Inc()
 		}),
 	)
-	selector := routing.NewSelector(backendRepo, policyRepo, breaker)
+	selector := routing.NewSelector(backendRepo, policyRepo, breaker, routing.WithMetrics(m))
 	inferenceClient := inference.New(inference.Config{
 		Timeout:     time.Duration(cfg.BackendTimeoutMS) * time.Millisecond,
 		MaxAttempts: cfg.RetryMaxAttempts,
