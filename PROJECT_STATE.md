@@ -53,19 +53,501 @@ flowchart LR
 ## The 7 stages
 
 1. **Foundations** (config, errors, logging, metrics scaffold) — ✅ **DONE** (`make verify` green)
-2. Data layer (migrations, db, redisstore, models, repos) ← **NEXT**
-3. Gateway core (server, middleware, auth, health/ready, seed, /v1/models)
-4. Sync inference (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions)
-5. Cache + idempotency + rate limiting
-6. Batch jobs + Redis Streams + control-worker
-7. Docker/Compose/Prometheus/E2E/README/docs/CI + final verification
+2. **Data layer** (migrations, db, redisstore, models, repos) — ✅ **DONE**
+3. **Gateway core** (server, middleware, auth, health/ready, seed, /v1/models) — ✅ **DONE**
+4. **Sync inference** (mock-llm, inference client, routing, retry/timeout, circuit breaker, /v1/chat/completions) — ✅ **DONE**, committed (`c38a2a6` + polish `eed317c`)
+5. **Cache + idempotency + rate limiting** — ✅ **DONE** (committed on branch)
+6. **Batch jobs + Redis Streams + control-worker** — ✅ **DONE** (committed on branch)
+7. **Docker/Compose/Prometheus/E2E/README/docs/CI** — ✅ **DONE** (implemented; **uncommitted** — see "Current state")
+
+**PROJECT PHASE: COMPLETE.** All 7 stages implemented. Post-MVP **Stage 8**
+(observability patches + load benchmark) and **Stage 9** (interactive demo:
+Grafana, scenario driver, browser console, README GIF) are also done. Only
+`docs/future-work.md` items remain intentionally unbuilt.
+
+## Stage 9 — interactive demo (2026-07-14, post-MVP, uncommitted)
+
+Recruiter/reviewer-facing interactive layer. **No Go source changed** (gate
+still green); still exactly three binaries — Grafana and nginx are external
+images, like Prometheus. All artifacts verified live (see below).
+
+- **`docker-compose.demo.yml`** overlay (mirrors the bench-overlay pattern):
+  ~40ms mock latency, `RATE_LIMIT_QPS=${DEMO_RATE_LIMIT_QPS:-1000}`, plus two
+  new services — `grafana` (`grafana/grafana:11.5.1`, :3000, anonymous Viewer,
+  file-provisioned) and `demo-console` (`nginx:1.27-alpine`, :8000, serves the
+  static console and reverse-proxies gateway+Prometheus so the browser stays
+  same-origin; the gateway stays CORS-free).
+- **Grafana provisioning** — `observability/grafana/provisioning/{datasources,
+  dashboards}` + `observability/grafana/dashboards/aegisroute.json` (13 panels
+  over the 15-metric set: stat row with breaker-state value mappings, HTTP/
+  latency-by-cache/backend/breaker/cache/batch/in-flight timeseries; datasource
+  uid `aegisroute-prom` is referenced by every panel).
+- **Scenario files** `demo/scenarios/*.json` (declarative: type, counts,
+  concurrency, body, narrative) + **`scripts/demo.sh`** driver (menu / `list` /
+  `<name>`; curl+jq only — no hey; `xargs -P` concurrency; exact metric deltas
+  read from `/metrics`, not Prometheus, to avoid scrape lag; curl `%header{}`
+  feature-detect). Scenarios: `cache-storm`, `idempotency-replay` (races one
+  key: 1×200 + 9×409, then replays with backend delta +0), `rate-limit-burst`
+  (recreates gateway with `DEMO_RATE_LIMIT_QPS=10`, restores after),
+  `backend-outage` (stops the container, drives traffic, shows breaker
+  open→failover→recovery), `batch-flood` (2×100 items).
+- **`demo/console/`** — static `index.html` (vanilla JS: live stat tiles
+  polling PromQL every 3s incl. per-backend breaker state, buttons for the
+  browser-runnable scenarios, a live-traffic toggle for the kill-a-backend
+  party trick) + `nginx.conf`.
+- **Makefile**: `demo` (demo-up + menu), `demo-up`, `demo-down`, `demo-gif`.
+- **`scripts/demo.tape`** (vhs) → **`docs/assets/demo.gif`** (recorded live,
+  2.1 MB: cache-storm, idempotency, backend-outage). README got an
+  "Interactive demo" section embedding it; `docs/demo.md` is the full guide;
+  `docs/future-work.md` updated (Grafana shipped; hosted-public-demo noted).
+
+**Live verification (2026-07-14): PASSED.** Demo stack up (all 9 services);
+Grafana healthy with datasource uid + dashboard provisioned and queryable
+anonymously; console serves and both proxy paths work (chat 200 via
+`:8000/gateway/...`). All five scenarios run green end-to-end: cache-storm
+(MISS 78.3ms → HIT 1.1ms, 200/200 HIT after warm, backend +1);
+idempotency-replay (1×200 + 9×409 race, then 20 replays backend **+0**);
+rate-limit-burst (40/50 → 429 at QPS=10, counter +40, default restored);
+backend-outage (150/150 → 200 during a real container stop, fast +30 / cheap
++150, breaker state 2, short-circuits +140, recovery to state 0 after
+restart+cooldown); batch-flood (200 items succeeded in ~2s, worker +200).
+`make verify` green before and after (no Go changes).
+
+## Stage 8 — observability + benchmark (2026-07-08, post-MVP, uncommitted)
+
+Additive only; no feature behavior changed. Metric set grew 10 → **15**
+`aegisroute_*` collectors:
+
+- **Patch A** — fine latency buckets (down to 0.5ms) on the HTTP + backend
+  duration histograms, so p95/p99 on a sub-ms-cache gateway reads accurately.
+- **Patch B** — `aegisroute_chat_completion_duration_seconds{cache}` histogram,
+  observed in the chat handler via a top-of-handler timer + `chatOutcome`
+  (hit|miss|bypass), so HIT vs BYPASS latency is readable straight from metrics.
+- **Patch C** — reliability counters: `aegisroute_backend_retries_total`
+  (inference retry loop), `aegisroute_circuit_breaker_short_circuits_total`
+  (selector skips an open circuit), `aegisroute_circuit_breaker_transitions_total{to}`
+  (breaker state listener).
+- **Patch D** — `aegisroute_backend_in_flight` gauge on the selector semaphore
+  (inc on select, dec in the `sync.Once` release).
+- Wired `routing.WithMetrics(m)` into both cmd mains; DECISIONS.md table +
+  `internal/routing/CLAUDE.md`-consistent. Tests green incl. `-race`.
+
+Benchmark: `docker-compose.bench.yml` (rate limit off, ~40ms mock backend) +
+`scripts/bench.sh` (`make bench`) using **hey** (external dev tool — still three
+binaries; no `cmd/` load generator). It runs uncached-BYPASS vs cached-HIT `hey`
+profiles, chunked batch throughput (API caps 100 items/batch, so 200 items = 2
+batches), Prometheus PromQL extraction, and rate-limit + circuit-breaker demos;
+writes `docs/benchmarks.md`.
+
+**`make bench` live-run (2026-07-08, Apple M2, 8 cores): PASSED.** Cache p95
+≈48ms→8ms (**5.8×**), throughput ≈1.1k→11.6k rps (**10.4×**), hit ratio 0.9999;
+batch 200 items→succeeded in ~2s (~6000 items/min); rate-limit 45/50→429;
+circuit breaker opened (state=2), 180 short-circuits, 40 retries, **200/200
+served via failover** to mock-llm-cheap. `docs/benchmarks.md` +
+`docs/resume-bullets.md` carry the real numbers. Files touched:
+`internal/metrics`, `internal/api/chat.go`, `internal/inference/client.go`,
+`internal/routing/selector.go`, both `cmd/*/main.go`, `DECISIONS.md`,
+`docker-compose.bench.yml`, `scripts/bench.sh`, `Makefile`, `docs/`.
+
+### Post-Stage-8 verification pass (3 e2e runs, 2026-07-08) — 1 fix (uncommitted)
+
+Three full `scripts/e2e.sh` runs (plus a metrics-capture bring-up) to validate
+the packaged dataflow. Runs #1 and #2 passed; **run #3 failed intermittently**
+at the live-integration step — the one Major bug this surfaced:
+
+1. **MAJOR — non-deterministic batch-item ordering (flaky test + wrong API
+   order):** `JobRepo.Items` ordered by `created_at ASC, id ASC`, but every item
+   of a batch is inserted in one transaction, so they share a `created_at` and
+   the effective sort fell through to the random `gen_random_uuid()` `id`.
+   Consequences: (a) `GET /api/v1/batch-jobs/{id}/items` returned a batch's items
+   in a different order on every request, and (b) `TestIntegration/JobRepo`
+   (`assert items[0].CustomID == "a"`) flaked. Reproduced **15/40** failures on
+   the old query. Fix: order by `custom_id ASC` — `custom_id` is UNIQUE per job
+   (`uq_batch_job_items_job_custom`), so it is a total, deterministic order, and
+   the read is now served straight from that index with no sort step.
+   `internal/jobs/memstore.go` sorts its `Items` by `custom_id` to mirror the DB
+   contract (so the fake can't drift from Postgres again), and the integration
+   test now asserts the full `[a, b]` order.
+
+Verified: `make verify` green; the `JobRepo` integration test looped **40/40**
+after the fix (was 15/40 failing before); full `go test -tags=integration ./...`
+green ×3; a fourth full `scripts/e2e.sh` run PASSED end to end (chat MISS→HIT,
+batch succeeded with both items terminal, both processes export `aegisroute_*`,
+live integration step green). Files touched: `internal/db/job_repo.go`,
+`internal/db/integration_test.go`, `internal/jobs/memstore.go`.
+
+## Current state (2026-07-07) — Stage 7 DONE, MVP COMPLETE, uncommitted
+
+All 7 stages are implemented. The Docker-free gate is green (`gofmt -l .`
+empty, `go vet ./...`, `go build ./...`, `go test ./...`). **Deliberately
+uncommitted** per instruction. Suggested final commit:
+
+```
+git commit -m "feat: docker compose, prometheus, e2e, docs, CI — MVP complete"
+```
+
+What shipped (Stage 7 — package/run/verify/document):
+
+- **Dockerfiles** (`deploy/docker/{gateway-api,control-worker,mock-llm}.Dockerfile`)
+  — multi-stage, pinned `golang:1.25.11` build stage, static CGO-free binaries
+  (`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`), final stage on
+  `gcr.io/distroless/static-debian12:nonroot` (non-root, no `:latest`).
+  `.dockerignore` trims the build context.
+- **`docker-compose.yml`** — postgres (`pg_isready` healthcheck + `pgdata`
+  named volume), redis (`redis-cli ping` healthcheck), gateway-api (`:8080`,
+  `depends_on` healthy PG/Redis, `AEGISROUTE_AUTO_MIGRATE`/`AUTO_SEED=true`,
+  service-name `DATABASE_URL`/`REDIS_ADDR`, seed backend URLs),
+  control-worker (`:9100`, `ValidateForWorker` so it needs only DB+Redis),
+  mock-llm-fast (`:8081`) + mock-llm-cheap (`:8082`) both `MOCK_MODEL_NAME=llama-fast`,
+  prometheus (`:9090`). Service-name networking, no platform pins.
+- **`observability/prometheus.yml`** — scrapes `gateway-api:8080` and
+  `control-worker:9100`.
+- **`scripts/e2e.sh`** — `set -euo pipefail`; preflight for docker/curl/jq/go;
+  cleanup trap (`docker compose down -v --remove-orphans`); clean-slate start;
+  gofmt/vet/test gate; `up -d --build`; **bounded** readiness waits
+  (30×2s = 60s cap) for `/readyz` + `/healthz`; chat MISS then HIT (distinct
+  idempotency keys); batch create → **bounded** terminal poll (30×2s) → both
+  items terminal; gateway + worker `aegisroute_*` metrics; live
+  `go test -tags=integration ./...` with the host-side env exported. Every
+  wait is time-bounded.
+- **Makefile** — real `dev-up` (`up -d --build`), `dev-down`
+  (`down -v --remove-orphans`), `logs` (`logs -f`), `verify-e2e`
+  (`bash scripts/e2e.sh`).
+- **`.github/workflows/ci.yml`** — `unit` (gofmt/vet/test, Docker-free) +
+  `integration` (postgres+redis service containers → `-migrate` →
+  `go test -tags=integration ./...`), Go 1.25, module cache.
+- **`README.md`** — full: overview, not-a-chatbot, not-a-thin-proxy, mermaid
+  diagram, quickstart, LOCAL-ONLY creds, curl + cache-HIT + batch + metrics
+  demos, Developer Operations, Assumptions & Tradeoffs, failure modes.
+- **`docs/`** — architecture.md, api.md, failure-modes.md, resume-bullets.md,
+  future-work.md (non-MVP items only; `XAUTOCLAIM` is NOT listed as future work
+  — it's already used).
+
+**`make verify-e2e` live-run status: PASSED (2026-07-07, Docker 29.6.1 /
+Compose v2).** Ran the full script end to end: all five pinned base images
+pull (`golang:1.25.11`, `gcr.io/distroless/static-debian12:nonroot`,
+`prom/prometheus:v3.1.0`, `postgres:17-alpine`, `redis:7-alpine`); postgres +
+redis reach healthy; gateway `/readyz` and worker `/healthz` up on attempt 1;
+sync chat #1 → `X-AegisRoute-Cache: MISS`, #2 (new key, same body) → `HIT`;
+batch job reached `succeeded` with both items terminal; both processes export
+`aegisroute_*`; live `go test -tags=integration ./...` all PASS; cleanup trap
+tore the stack down (verified no leftover containers). The Docker-free gate
+(`gofmt`/`vet`/`build`/`test`) is also green. Separately verified Prometheus
+scrapes both targets `health=up` and ingests the `aegisroute_*` series.
+
+### Post-Stage-7 verification pass (2 runs) — 3 fixes (uncommitted)
+
+Two verification passes over the packaging/ops/docs artifacts and the packaged
+dataflow. No unusable-level defect (the stack builds, runs, and the full E2E
+passes), but one Major flakiness bug:
+
+1. **MAJOR — e2e integration step raced the live worker:** step (l) ran
+   `go test -tags=integration ./...` while the `control-worker` container was
+   up. `JobRepo.PendingOutbox` has no tenant filter, so the worker's 5s
+   outbox-drain published the integration tests' freshly-created jobs and its
+   consume loop then claimed those items — racing the tests' own
+   `PendingOutbox`/`ClaimNextQueuedItem` assertions (~10% flaky-failure
+   window; it passed the first run by timing luck). Fix: `scripts/e2e.sh` now
+   `docker compose stop control-worker` before the integration step (those
+   tests exercise the data layer against live Postgres+Redis; the worker is
+   not under test and the stores stay up).
+2. **OTHER — e2e batch poll could abort on a transient blip:** the poll's
+   `status="$(curl -fsS … | jq …)"` under `set -euo pipefail` would exit the
+   whole run on one transient curl/jq failure instead of retrying within the
+   bounded loop. Fix: `… 2>/dev/null | jq … 2>/dev/null || true` so the bounded
+   loop keeps polling.
+3. **MINOR — README version accuracy:** README said go.mod declares `go 1.25`;
+   it declares `go 1.25.7`. Corrected, with a note that the pinned
+   `golang:1.25.11` build image is a patch ≥ the directive (no toolchain
+   download).
+
+Verified-correct (no change): `golang:1.25.11` satisfies `go 1.25.7` and builds
+with a local-only toolchain (no forced download); all five pinned images pull;
+`docker compose config` valid; `promtool check config` passes; CI YAML parses;
+Prometheus scrapes both processes `up`; doc claims (status codes, routing,
+fail-open/closed) match the code. Files touched: `scripts/e2e.sh`, `README.md`.
+
+## Prior state (2026-07-07) — Stage 6 DONE (committed `e65a64b`)
+
+What shipped (Stage 6):
+
+- **`internal/redisstore` queue** — `Queue` interface
+  (`Publish`/`Consume`/`Ack`/`Claim`/`PublishDLQ`) + `Message{ID,JobID}`.
+  Redis Streams adapter (`queue.go`): `XADD` publish; consumer group created
+  with `MKSTREAM` at offset **0** (so a worker booted after the API already
+  published still drains the backlog); `XREADGROUP` per-instance consumer
+  that **never auto-acks**; `XACK` in `Ack`; `XAUTOCLAIM` in `Claim`; `XADD`
+  to `<stream>:dlq` in `PublishDLQ`. In-memory `MemQueue` fake (`memqueue.go`)
+  mirrors the at-least-once contract (delivery → in-flight set, Ack the only
+  exit, handler error leaves it recoverable, `Claim` by idle age) with
+  publish-error injection and DLQ/ack/inflight/pending introspection for tests.
+- **`internal/jobs`** — pure status machines (`status.go`:
+  `ValidJobTransition`, `ValidItemTransition`, `AggregateJobStatus`), the
+  `JobStore` interface + claim result types (`store.go`), and the in-memory
+  `MemStore` (`memstore.go`). `jobs.ErrNotFound` is the store's absence
+  sentinel (db imports jobs for the claim types, mirroring db←idempotency).
+- **`internal/db/job_repo.go`** — `JobRepo`: `CreateWithItemsAndOutbox` in one
+  transaction (job=queued + N items=queued + one pending outbox row);
+  `ClaimNextQueuedItem` atomic via `FOR UPDATE SKIP LOCKED` with claim-time
+  exhaustion (attempts+1 > max → item durably failed, `ClaimExhausted`);
+  `UpdateItemTerminal` guarded by `WHERE status='running'` (terminal items
+  immutable → redelivery-safe); `RecomputeAndUpdateJobStatus` derives status
+  in SQL mirroring `AggregateJobStatus`; `RequeueRunningItems` for crash
+  recovery; outbox drain/publish/fail marks; all reads tenant-scoped.
+- **`internal/api` batch handlers** (`batch.go`) — `POST /api/v1/batch-jobs`
+  (10 MiB cap; MVP schema `{requests:[{custom_id,body}]}`; reuses the Stage-4
+  chat validation per item body; 1..100 items; unique non-empty custom_id;
+  same-model rule stored in `batch_jobs.model`; **Stage-5 idempotency
+  precedence** — Check → rate limit → Begin → work → Complete/Release;
+  transactional create then **exactly one** job-level publish; publish failure
+  marks the outbox failed-attempt and leaves it pending, never orphaning the
+  job). `GET` list/get/items **all tenant-filtered** (cross-tenant read = 404).
+  New Deps interfaces `BatchJobStore` + `JobPublisher`; wired into the bearer
+  group (GETs take the shared per-key rate budget via middleware, create checks
+  it inline like chat).
+- **`internal/worker`** (`worker.go`) — `Worker` consumes job messages: set
+  job running → **bounded pool** (semaphore = `WORKER_CONCURRENCY`) each
+  goroutine repeatedly `ClaimNextQueuedItem` → shared `internal/routing` +
+  `internal/inference` (with intra-item failover; **never HTTP to
+  gateway-api**) → durable terminal write → after all items terminal,
+  `RecomputeAndUpdateJobStatus` → **only then `Ack`**. Redelivery-safe
+  (terminal items unclaimable). `RequeueRunningItems` recovers items a crashed
+  worker left running. Exhaustion (`WORKER_MAX_ITEM_ATTEMPTS`) → exactly one
+  DLQ entry per item, keep processing the rest. Periodic `Claim` (XAUTOCLAIM)
+  reclaim loop + periodic outbox-drain loop (`PendingOutbox` → `Publish` →
+  `MarkOutboxPublished`, mark published only after publish succeeds). Pool
+  goroutines are panic-safe (no ack → redelivery).
+- **`cmd/control-worker/main.go`** — config → logger → pgx pool → redis →
+  metrics → shared breaker/selector/inference/queue/store/worker →
+  `worker.Run` (consume + reclaim + outbox tickers) + `/healthz` + `/metrics`
+  on `WORKER_METRICS_PORT` → graceful shutdown on SIGINT/SIGTERM.
+- **Metrics** — `BatchJobsCreatedTotal` (create), `BatchItemsProcessedTotal
+  {outcome}` (worker per-item), `WorkerFailuresTotal` (worker-level failures,
+  not per-item business failures).
+
+Stage-6 tests (all Docker-free): pure status machine (every transition + all
+three aggregations); MemStore (tenant scoping, concurrent claims never
+duplicate, exhaustion, terminal immutability, aggregation, outbox lifecycle);
+queue adapter over **miniredis** (publish→consume→ack; Consume-no-auto-ack +
+`Claim` recovers a stranded pending message using `mr.SetTime` — note
+`FastForward` does NOT age stream PEL entries, only TTLs; DLQ stream; backlog
+published before the group existed); MemQueue fake; **worker pool** (white-box:
+concurrency peak ≤ limit via atomic counter, redelivery skips terminal items,
+**Ack strictly after the durable store update** via instrumented recording
+wrappers, exhausted item → DLQ + job failed, partial-failure aggregation,
+outbox-drain retries then marks published only after publish succeeds); batch
+endpoints (create persists job+items+one outbox row + exactly one publish;
+publish failure keeps outbox pending; GET/items/list; idempotency-key replay
+returns same job id and doesn't re-create or re-publish; cross-tenant GET/items
+= 404; validation matrix). `internal/db/integration_test.go` gains `JobRepo`
+and `JobRepoClaimExhaustion` subtests (`//go:build integration`; `stage2Tables`
+already lists the batch tables).
+
+### Post-Stage-6 verification pass (2 end-to-end runs) — 4 fixes (uncommitted, DoD green under -race)
+
+Two full dataflow verifications (sync chat path + async batch path) surfaced
+and fixed four issues; no unusable-level (build/tests/demo path were already
+green), but two were Major worker-durability bugs:
+
+1. **MAJOR — poison message on a vanished job:** a valid-UUID message whose job
+   was deleted (its tenant removed, cascading) reached
+   `RecomputeAndUpdateJobStatus` → `jobs.ErrNotFound` → `failJobPass` → never
+   acked, so the reclaim loop redelivered it **forever**, spamming
+   `WorkerFailuresTotal` and DB queries every tick. Fix: `handleMessage` now
+   treats `jobs.ErrNotFound` from `MarkJobRunning`/`RecomputeAndUpdateJobStatus`
+   as terminal — `dropMissingJob` dead-letters and acks the moot message
+   (`internal/worker/worker.go`).
+2. **MAJOR — reclaim self-race → premature exhaustion:** for a job whose single
+   delivery ran longer than `ReclaimMinIdle` (60s), the same process's reclaim
+   loop `XAUTOCLAIM`ed the still-in-flight message and ran a second concurrent
+   pass; its `RequeueRunningItems` bounced items the consume loop was actively
+   processing back to `queued`, and with a small `WORKER_MAX_ITEM_ATTEMPTS`
+   the re-claim could **exhaust (DLQ) an item that was actually succeeding**.
+   Fix: the worker tracks in-flight delivery IDs (`markInFlight`/`isInFlight`);
+   `reclaimOnce` skips deliveries this process is already handling, and
+   `handleMessage` has an in-flight backstop that no-ops a double entry.
+3. **OTHER — unbounded Redis stream growth:** `XACK` removes an entry from the
+   group's pending list but not from the stream, so `XADD` without trimming
+   grew `aegisroute:batch_jobs` (and `:dlq`) without bound. Fix: approximate
+   `MAXLEN ~100000` on both `XADD`s (`internal/redisstore/queue.go`).
+4. **OTHER — worker required gateway-only config:** `control-worker` called
+   `ValidateForServe`, which demands `ADMIN_TOKEN`, `APP_KEY_HASH_SECRET`,
+   `APP_PORT`, `RATE_LIMIT_QPS`, `CACHE_TTL_SECONDS`, `IDEMPOTENCY_TTL_SECONDS`
+   the worker never uses. Fix: new `config.ValidateForWorker()` checks only the
+   stores, backend/retry/CB tuning, stream identity, and worker settings;
+   `cmd/control-worker` uses it.
+
+Also **closed a coverage gap**: added `TestWorker_EndToEndOverStreamQueue` —
+`worker.Run` driving the real Redis-Streams consume loop over miniredis
+(publish → consume → process → ack), which the unit tests (direct
+`handleMessage`) had not exercised. New tests: worker missing-job-drop,
+in-flight guard, the E2E path, and `ValidateForWorker`.
+
+Verified-correct (no change needed): the exhaustion math (`WORKER_MAX_ITEM_ATTEMPTS=N`
+→ N processing attempts then DLQ, no off-by-one); idempotent redelivery never
+double-counts `BatchItemsProcessedTotal` (terminal items unclaimable, terminal
+write guarded); the per-process circuit breaker is correctly shared by the
+worker's selector and outcome reports; a transient failure that exhausts
+failover is a terminal item result by design (cross-delivery retry via
+`WORKER_MAX_ITEM_ATTEMPTS` is for crash recovery, not backend blips).
+
+Files touched by the fixes: `internal/worker/worker.go` (+ `worker_test.go`),
+`internal/redisstore/queue.go`, `internal/config/config.go` (+ `config_test.go`),
+`cmd/control-worker/main.go`.
+
+### Stage-6 design notes / non-obvious decisions
+
+- **`jobs.ErrNotFound` (not `db.ErrNotFound`)** is the JobStore absence
+  sentinel: `db` imports `jobs` for `ClaimResult`/`ClaimOutcome`, so the
+  sentinel lives in `jobs`; `job_repo.go`'s `mapJobsNotFound` converts
+  driver no-rows to it. Handlers and the worker test `errors.Is(err,
+  jobs.ErrNotFound)`.
+- **Consumer group at offset 0 + `ensureGroup` only on Consume/Claim** (not
+  Publish) — the API publishes before any worker may exist; the group must
+  replay from the beginning, not `$`.
+- **`RequeueRunningItems` is necessary, not cosmetic:** without it, an item a
+  crashed worker left `running` is never re-selected (claims only pick
+  `queued`) and the job would never terminate → the message would redeliver
+  forever. Concurrent duplicate deliveries (only via reclaim after 60s idle)
+  can double-process an item, but that is idempotent (terminal items
+  immutable, no double count) and bounded — acceptable per the "no distributed
+  coordination beyond Postgres claims" non-goal.
+- **Ack ordering is the at-least-once contract** and is asserted directly with
+  instrumented store/queue wrappers recording call order.
+- Did **not** add `prometheus/testutil` for a counter assertion (it pulls a
+  new transitive module `kylelemons/godebug`); kept the locked dependency set.
+
+## Prior state (2026-07-06) — Stage 5 DONE
+
+Stage 5 is fully implemented and the Definition of Done is green
+(`gofmt -l .` empty; `go vet ./...`, `go build ./...`, `go test ./...` all
+pass Docker-free, also under `-race`), **deliberately uncommitted** per
+instruction. Commit with:
+
+```
+git commit -m "feat: response cache, idempotency, rate limiting on completion path"
+```
+
+What shipped:
+
+- `internal/cache` — eligibility (stream:false + effective temperature ≤ 0.2,
+  omitted → OpenAI default 1.0, explicit 0 cacheable), canonical body
+  (sorted keys, array order preserved), key = sha256(tenant/key scope ‖
+  canonical body), Redis entries (body + content type) with
+  CACHE_TTL_SECONDS; miniredis tests.
+- `internal/idempotency` — `Classify` (single semantics source),
+  `IdempotencyStore` (Lookup/Begin/Complete), `Coordinator`
+  (Check → rate limit → Begin → Complete), `Scope` (tenant+key+method+route,
+  reused by Stage 6); in-memory-fake tests.
+- `internal/db/idempotency_repo.go` — Postgres-authoritative store; atomic
+  INSERT … ON CONFLICT … WHERE reclaim of expired/stale-pending rows (DB
+  clock); integration subtest covers insert/conflict/reclaim/complete/expiry.
+- `internal/ratelimit` — Redis fixed-window per API key; INCR+PEXPIRE in one
+  Lua invocation (an orphaned counter without expiry is impossible);
+  miniredis + FastForward tests. Fail-open on Redis errors.
+- `internal/api` — chat handler reworked to the exact precedence (raw body
+  read once → raw-bytes hash → validate → idempotency Check → rate limit →
+  Begin → cache lookup → route/inference → cache store → ledger → Complete
+  on every path); `X-AegisRoute-Cache: HIT|MISS|BYPASS`; rate-limit
+  middleware on `GET /v1/models` (shared per-key budget, chat checks
+  inline); replay never reuses a stored X-Request-ID. Ledger rows now carry
+  `cache_result`; HIT rows have `backend_id` NULL.
+- `cmd/gateway-api` wiring (idempotency lock TTL = 2× ServerWriteTimeout);
+  `docs/design-decisions.md` (required precedence note + fail-open/closed
+  stances).
+
+Stage-5 tests: 14 handler-integration tests (miniredis + real
+cache/limiter/coordinator over an in-memory store), plus package tests for
+cache/idempotency/ratelimit and the db integration subtest.
+
+**Post-Stage-5 verification pass (2 rounds) found and fixed 3 issues (all
+uncommitted, DoD still green under -race):**
+
+1. **CRITICAL — idempotency reclaim id (data-integrity):** the Postgres
+   `Begin` used `ON CONFLICT DO UPDATE` which KEEPS the original PK id, but
+   the in-memory fakes and the integration test assume a reclaim mints a
+   FRESH id. Consequences: (a) the integration test would FAIL on real
+   Postgres, and (b) a crashed/lapsed owner's `Complete(oldID)` could
+   overwrite the reclaimer's in-flight record with a stale response. Fixed by
+   adding `id = gen_random_uuid()` to the reclaim `SET`, so the old owner's
+   `Complete`/`Release` safely no-op.
+2. **CRITICAL — transient errors were cached under the idempotency key:** a
+   5xx (e.g. a momentary all-backends-down 503) was stored and replayed for
+   the whole TTL (24h default), so a client correctly reusing its
+   Idempotency-Key on retry was locked out even after the gateway recovered.
+   Fixed: added `Release` to the store/coordinator/gate; `respondChat` now
+   Completes only `< 500` (success + deterministic 4xx) and Releases `>= 500`
+   so the retry is a fresh attempt.
+3. **Hardening — unbounded Idempotency-Key:** capped at 255 chars, rejected
+   with 400 before any store interaction (it is part of a unique index).
+
+Files touched by the fixes: internal/db/idempotency_repo.go,
+internal/idempotency/idempotency.go (+ _test), internal/api/chat.go +
+router.go (+ chat_stage5_test, helpers_test), internal/db/integration_test.go,
+DECISIONS.md, docs/design-decisions.md.
+
+## Stage 4 state (2026-07-05)
+
+Stage 4 is fully implemented, committed as `c38a2a6` ("feat: mock-llm,
+inference client, routing, circuit breaker, chat completions"), and the
+Definition of Done is green (`gofmt -l .` empty; `go vet ./...`,
+`go build ./...`, `go test ./...` all pass, Docker-free). That commit
+includes an adversarial-review hardening pass folded in before commit:
+
+- caller-context cancellation is classified as "canceled", never as a
+  transient backend failure (circuit breaker + metrics no longer poisoned by
+  client disconnects); `Breaker.ReportCanceled` returns a reserved half-open
+  probe slot;
+- chat validation is case-SENSITIVELY strict (stdlib JSON tag matching would
+  otherwise have accepted `"MODEL"`/`"Stream"`/`"Role"` aliases);
+- the inference_requests ledger insert runs on a context detached from the
+  request's cancellation, so disconnects can't erase audit rows;
+- `backoff()` honors a zero base.
+
+A later session added AI-assistant context docs (no source changes):
+`CLAUDE.md` (root), `docs/REPO_MAP.md`, `docs/STAGE_STATUS.md`,
+`internal/db/CLAUDE.md`, `internal/routing/CLAUDE.md`,
+`internal/jobs/CLAUDE.md` (the requested "queue" rules — there is no
+`internal/queue` package; the `Queue` interface is documented to live in
+`internal/jobs`, see that file's naming note).
+
+**Uncommitted Stage-4 polish (this session — NOT committed, per instruction):**
+six gateway-hardening items on top of `c38a2a6`, DoD green under `-race`
+(254 test cases, up from 144). All are documented in DECISIONS.md's Stage-4
+section; suggested commit message: `feat: intra-request failover, async
+ledger, response cap, panic-safe circuit, timeout-budget validation`.
+
+1. **Intra-request failover** — the handler now re-selects (excluding tried
+   backends via `Selector.Select(ctx, model, exclude...)`) and calls the next
+   healthy backend on a transient failure, instead of 503-ing until the
+   circuit trips. Permanent errors/cancellations don't fail over.
+2. **Async ledger** (`internal/api/ledger.go`, `AsyncLedger`) — the
+   inference_requests write moved off the hot path onto a bounded worker pool
+   fed by a buffered queue; wired in `cmd/gateway-api` and closed-before-pool
+   on shutdown. `Deps.Requests` → `Deps.Ledger` (`LedgerRecorder`).
+3. **Response size cap** — `inference.Config.MaxResponseBytes` (default 10 MiB
+   via `io.LimitReader`); oversized reply → permanent error, no OOM.
+4. **Panic-safe circuit report** — `callBackend` defers `release()` and a
+   fallback `ReportCanceled`, so a panic can't strand a half-open probe.
+5. **Timeout-budget validation** — `config.ServerWriteTimeout` (shared by the
+   http.Server and `ValidateForServe`) + `config.InferenceBudget()`; the
+   handler bounds all failover attempts by that budget.
+6. **Permanent e2e wiring test** (`internal/api/e2e_test.go`) — real
+   Selector+Client+Breaker vs httptest backends (happy path, intra-request
+   failover, circuit-opens-and-sheds).
+
+**Branch note:** work lives on `stage4_sync_inference_v2`, cut from
+`stage3_gateway_core` (60fca48). The older `stage4_Sync_inference` branch was
+mistakenly cut from the Stage-2 lineage and contains no Stage-3 code — do not
+resume there; its tree is byte-identical to the Stage-2 commit inside
+stage3's history, so it can be deleted.
 
 ## Scope table
 
 | Bucket | Contents |
 | --- | --- |
-| **Current stage (build now)** | Stage 1 — COMPLETE. Next session builds Stage 2 only: migrations, db, redisstore, models, repos. |
-| **Future milestones (roadmap only)** | Stages 3–7. Do not create their source files, Docker assets, CI, scripts, or README sections early. Future-stage Makefile targets fail with `not implemented until Stage X`. |
+| **Current stage (build now)** | Stages 1–6 COMPLETE (Stage 6 uncommitted). Next session builds Stage 7 only: Dockerfiles + docker-compose (postgres, redis, both mock-llms, gateway, worker, prometheus), Prometheus scrape config, `make dev-up/dev-down/logs/verify-e2e`, E2E script, GitHub Actions CI, full README + docs/future-work.md, final verification. |
+| **Future milestones (roadmap only)** | None after Stage 7 (final stage). Do not create Stage-7 assets before starting Stage 7. |
 | **Context only (never a build order)** | Architecture diagram, locked stack, ports table, demo credentials, Docker/compose notes, resume-positioning language. |
 | **Non-goals (entire MVP; mention only in docs/future-work.md)** | k6, Grafana dashboards, Kubernetes, Terraform, real model providers, OIDC, RBAC, SSE/streaming, gRPC, sqlc, global/distributed concurrency control. |
 
@@ -96,8 +578,12 @@ prometheus         :9090
 
 ## How to resume
 
-1. Read this file, `TODO.md`, `IMPLEMENTATION_LOG.md`, `DECISIONS.md`.
+1. Read `CLAUDE.md` (entry point), then this file, `TODO.md`,
+   `IMPLEMENTATION_LOG.md`, `DECISIONS.md`. For structure, see
+   `docs/REPO_MAP.md` and `docs/STAGE_STATUS.md`.
 2. Run `make verify` (must be green before starting new work).
 3. Work on the first unchecked stage in `TODO.md` — and only that stage.
+   Check for a package-local `CLAUDE.md` (e.g. `internal/db/CLAUDE.md`)
+   before touching that package.
 4. Before stopping: update this file's stage status, tick `TODO.md`, append
    `IMPLEMENTATION_LOG.md`, and record any failing command + error verbatim.

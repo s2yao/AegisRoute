@@ -1,0 +1,567 @@
+{
+  "title": "AegisRoute — Control Plane",
+  "uid": "aegisroute",
+  "tags": ["aegisroute", "demo"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "annotations": { "list": [] },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Requests / s",
+      "description": "All routes, 1m rate.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+          "unit": "reqps",
+          "decimals": 1,
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aegisroute_http_requests_total[1m]))",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Cache hit ratio (5m)",
+      "description": "hits / (hits + misses); bypasses excluded.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "#199e70" },
+          "unit": "percentunit",
+          "decimals": 2,
+          "min": 0,
+          "max": 1,
+          "noValue": "—"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aegisroute_cache_events_total{result=\"hit\"}[5m])) / clamp_min(sum(rate(aegisroute_cache_events_total{result=~\"hit|miss\"}[5m])), 1e-9)",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Rate-limited / s",
+      "description": "429s from the per-key limiter, 1m rate.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "#c98500" },
+          "unit": "reqps",
+          "decimals": 1,
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aegisroute_rate_limited_total[1m]))",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Batch items / s",
+      "description": "Items the control-worker finished, 1m rate.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "#9085e9" },
+          "unit": "reqps",
+          "decimals": 1,
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aegisroute_batch_items_processed_total[1m]))",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Circuit breakers",
+      "description": "Per-backend breaker state: CLOSED = healthy, OPEN = shedding.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "CLOSED", "color": "green", "index": 0 },
+                "1": { "text": "HALF-OPEN", "color": "orange", "index": 1 },
+                "2": { "text": "OPEN", "color": "red", "index": 2 }
+              }
+            }
+          ],
+          "noValue": "—"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (aegisroute_circuit_breaker_state)",
+          "legendFormat": "{{backend}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "HTTP requests by status",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "2.." },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "4.." },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "5.." },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e66767" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(aegisroute_http_requests_total[1m]))",
+          "legendFormat": "{{status}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Chat completion p95 by cache outcome",
+      "description": "End-to-end /v1/chat/completions latency. HIT should sit far below MISS/BYPASS.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*hit.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*miss.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*bypass.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, cache) (rate(aegisroute_chat_completion_duration_seconds_bucket[1m])))",
+          "legendFormat": "{{cache}} p95",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Backend requests by backend and outcome",
+      "description": "Watch traffic fail over from mock-llm-fast to mock-llm-cheap during the outage scenario.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*fast.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*cheap.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (backend, outcome) (rate(aegisroute_backend_requests_total[1m]))",
+          "legendFormat": "{{backend}} {{outcome}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Breaker state over time",
+      "description": "0 = closed, 1 = half-open, 2 = open.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 9, "w": 6, "x": 12, "y": 13 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "none",
+          "decimals": 0,
+          "min": -0.2,
+          "max": 2.2,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "closed", "index": 0 },
+                "1": { "text": "half-open", "index": 1 },
+                "2": { "text": "open", "index": 2 }
+              }
+            }
+          ],
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*fast.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*cheap.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (aegisroute_circuit_breaker_state)",
+          "legendFormat": "{{backend}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Retries and short-circuits",
+      "description": "Retries: transient failures re-attempted. Short-circuits: requests skipped because a circuit was open.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 9, "w": 6, "x": 18, "y": 13 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "^retries.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^short-circuits.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e66767" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (backend) (rate(aegisroute_backend_retries_total[1m]))",
+          "legendFormat": "retries {{backend}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (backend) (rate(aegisroute_circuit_breaker_short_circuits_total[1m]))",
+          "legendFormat": "short-circuits {{backend}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Cache lookups by result",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "hit" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "miss" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "bypass" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(aegisroute_cache_events_total[1m]))",
+          "legendFormat": "{{result}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Batch processing",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*succeeded.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*failed.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#e66767" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*jobs.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#9085e9" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(aegisroute_batch_items_processed_total[1m]))",
+          "legendFormat": "items {{outcome}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(aegisroute_batch_jobs_created_total[1m]))",
+          "legendFormat": "jobs created/s",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Backend in-flight",
+      "description": "Live max_in_flight semaphore holders per backend.",
+      "datasource": { "type": "prometheus", "uid": "aegisroute-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*fast.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*cheap.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (aegisroute_backend_in_flight)",
+          "legendFormat": "{{backend}}",
+          "datasource": { "type": "prometheus", "uid": "aegisroute-prom" }
+        }
+      ]
+    }
+  ]
+}

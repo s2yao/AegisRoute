@@ -1,2 +1,6 @@
-// Package inference calls upstream model backends with timeout, retry, per-backend concurrency limits, and a circuit breaker (built in Stage 4).
+// Package inference executes outbound calls to model backends: one Client
+// shared by the completion handler and the batch worker, with a per-attempt
+// timeout, bounded retries with exponential backoff and full jitter on
+// transient failures only, and typed errors distinguishing transient from
+// permanent outcomes for the circuit breaker.
 package inference

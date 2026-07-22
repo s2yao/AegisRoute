@@ -1,0 +1,15 @@
+{
+  "name": "idempotency-replay",
+  "title": "Idempotency - concurrent duplicates conflict, completed replays are free",
+  "type": "idempotency",
+  "concurrent_duplicates": 10,
+  "replays": 20,
+  "body": {
+    "model": "llama-fast",
+    "messages": [{ "role": "user", "content": "Charge my card exactly once." }],
+    "temperature": 0.9,
+    "max_tokens": 64
+  },
+  "narrative": "Phase 1: ten requests race in with the SAME fresh Idempotency-Key - exactly one executes, the rest get 409 (in progress). Phase 2: after the winner completes, twenty more replays with that key all return the stored response - the driver proves the backend was not called again by diffing aegisroute_backend_requests_total. temperature 0.9 keeps the response cache out of the picture, so idempotency alone does the work.",
+  "watch": "The driver's backend-call delta (phase 2 must be +0) and the 409 count in phase 1."
+}

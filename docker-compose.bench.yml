@@ -1,0 +1,34 @@
+# Benchmark overlay for the base docker-compose.yml. Use with:
+#   docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --build
+#
+# It changes only tuning knobs, never topology, so `scripts/bench.sh` measures
+# the gateway itself rather than artefacts of the demo defaults:
+#   - RATE_LIMIT_QPS is raised effectively-off so a throughput run measures the
+#     gateway, not a wall of 429s (the base default of 20 would rate-limit a
+#     load test almost immediately).
+#   - the mock backends get a realistic ~40ms latency (+5ms jitter) so the
+#     cache speedup is honest and visible: a sub-millisecond HIT vs a ~40ms
+#     BYPASS that traverses the full auth → route → inference → persist path.
+#
+# The values are env-substitutable (with the bench defaults above) so
+# scripts/bench.sh can recreate just one service for a targeted phase — a low
+# RATE_LIMIT_QPS for the rate-limit demo, or MOCK_FAILURE_RATE=1 on the "fast"
+# backend for the circuit-breaker demo — without a second overlay file.
+
+services:
+  gateway-api:
+    environment:
+      RATE_LIMIT_QPS: "${BENCH_RATE_LIMIT_QPS:-1000000}"
+      AEGISROUTE_AUTO_SEED: "true"
+
+  mock-llm-fast:
+    environment:
+      MOCK_LATENCY_MS: "${BENCH_MOCK_LATENCY_MS:-40}"
+      MOCK_JITTER_MS: "${BENCH_MOCK_JITTER_MS:-5}"
+      MOCK_FAILURE_RATE: "${BENCH_FAST_FAILURE_RATE:-0}"
+
+  mock-llm-cheap:
+    environment:
+      MOCK_LATENCY_MS: "${BENCH_MOCK_LATENCY_MS:-40}"
+      MOCK_JITTER_MS: "${BENCH_MOCK_JITTER_MS:-5}"
+      MOCK_FAILURE_RATE: "0"

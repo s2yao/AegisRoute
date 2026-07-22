@@ -1,0 +1,15 @@
+# Grafana datasource provisioning for the demo stack. Grafana runs in the same
+# Compose network, so it reaches Prometheus by service name. The fixed uid is
+# referenced by every panel in dashboards/aegisroute.json — keep them in sync.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: aegisroute-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

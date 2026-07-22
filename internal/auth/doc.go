@@ -1,2 +1,3 @@
-// Package auth authenticates bearer API keys (HMAC-SHA256 lookup) and the admin token (built in Stage 3).
+// Package auth hashes API keys (HMAC-SHA256) and provides the router's
+// bearer-API-key and admin-token authentication middleware.
 package auth

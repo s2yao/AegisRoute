@@ -247,4 +247,99 @@ func TestValidateForServe(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "ADMIN_TOKEN")
 	})
+	t.Run("rejects a retry chain that cannot fit the inference budget", func(t *testing.T) {
+		// 3 attempts × 20s already exceeds the 28s budget before backoff.
+		cfg := validServeConfig()
+		cfg.BackendTimeoutMS = 20000
+		cfg.RetryMaxAttempts = 3
+		err := cfg.ValidateForServe()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "inference budget")
+	})
+	t.Run("accepts a retry chain that fits the budget", func(t *testing.T) {
+		// Defaults: 3×5s + 2×2s = 19s, under the 28s budget.
+		assert.NoError(t, validServeConfig().ValidateForServe())
+	})
+}
+
+func TestInferenceBudget(t *testing.T) {
+	// The handler's total inference budget must sit strictly under the server
+	// write deadline so the response still has time to reach the client.
+	assert.Less(t, (&config.Config{}).InferenceBudget(), config.ServerWriteTimeout)
+	assert.Positive(t, (&config.Config{}).InferenceBudget())
+}
+
+func TestValidateForWorker(t *testing.T) {
+	// A worker-shaped config: the durable stores, backend/retry/CB tuning,
+	// stream identity, and worker pool settings — but none of the gateway-only
+	// inputs (admin token, key-hash secret, app port, rate/cache/idempotency).
+	validWorker := func() *config.Config {
+		return &config.Config{
+			LogLevel:              "info",
+			DatabaseURL:           "postgres://u:p@localhost:5432/db",
+			RedisAddr:             "localhost:6379",
+			BackendTimeoutMS:      5000,
+			RetryMaxAttempts:      3,
+			RetryBaseMS:           50,
+			RetryMaxMS:            2000,
+			CBFailureThreshold:    5,
+			CBCooldownMS:          10000,
+			WorkerConcurrency:     8,
+			WorkerMetricsPort:     9100,
+			WorkerMaxItemAttempts: 3,
+			StreamKey:             "aegisroute:batch_jobs",
+			StreamGroup:           "aegisroute-workers",
+		}
+	}
+
+	t.Run("passes without any gateway-only config", func(t *testing.T) {
+		assert.NoError(t, validWorker().ValidateForWorker())
+	})
+	t.Run("does not require ADMIN_TOKEN or APP_KEY_HASH_SECRET", func(t *testing.T) {
+		cfg := validWorker()
+		cfg.AdminToken = ""
+		cfg.AppKeyHashSecret = ""
+		cfg.RateLimitQPS = 0
+		cfg.CacheTTLSeconds = 0
+		cfg.IdempotencyTTLSeconds = 0
+		assert.NoError(t, cfg.ValidateForWorker(),
+			"the worker authenticates nobody and caches nothing")
+	})
+	t.Run("requires DATABASE_URL", func(t *testing.T) {
+		cfg := validWorker()
+		cfg.DatabaseURL = ""
+		err := cfg.ValidateForWorker()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DATABASE_URL")
+	})
+	t.Run("requires REDIS_ADDR", func(t *testing.T) {
+		cfg := validWorker()
+		cfg.RedisAddr = ""
+		err := cfg.ValidateForWorker()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "REDIS_ADDR")
+	})
+	t.Run("requires a positive WORKER_CONCURRENCY", func(t *testing.T) {
+		cfg := validWorker()
+		cfg.WorkerConcurrency = 0
+		err := cfg.ValidateForWorker()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WORKER_CONCURRENCY")
+	})
+	t.Run("requires a valid WORKER_METRICS_PORT", func(t *testing.T) {
+		cfg := validWorker()
+		cfg.WorkerMetricsPort = 0
+		err := cfg.ValidateForWorker()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WORKER_METRICS_PORT")
+	})
+	t.Run("requires STREAM_KEY and STREAM_GROUP", func(t *testing.T) {
+		cfg := validWorker()
+		cfg.StreamKey = ""
+		cfg.StreamGroup = ""
+		err := cfg.ValidateForWorker()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "STREAM_KEY")
+		assert.Contains(t, err.Error(), "STREAM_GROUP")
+	})
 }

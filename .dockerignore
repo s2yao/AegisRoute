@@ -1,0 +1,21 @@
+# Keep the build context small and reproducible: only go.mod/go.sum and Go
+# source are needed to build the static binaries. Everything below is either
+# irrelevant to the build or would bust the layer cache on every edit.
+.git
+.github
+.gitignore
+.dockerignore
+.env
+*.md
+docs/
+deploy/
+observability/
+scripts/
+bin/
+dist/
+tmp/
+coverage.*
+*.out
+*.test
+*.prof
+CLAUDE*

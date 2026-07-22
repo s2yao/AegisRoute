@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AegisRoute — demo console</title>
+<style>
+  /* Palette: validated categorical slots (light/dark selected per mode). */
+  :root {
+    --surface: #fcfcfb;
+    --card: #ffffff;
+    --border: #e4e3de;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #8a897f;
+    --blue: #2a78d6;
+    --aqua: #1baf7a;
+    --yellow: #eda100;
+    --violet: #4a3aa7;
+    --red: #e34948;
+    --good-bg: #e2f4ec;
+    --bad-bg: #fbe7e7;
+    --warn-bg: #fdf2da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #1a1a19;
+      --card: #232322;
+      --border: #3a3a37;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #8a897f;
+      --blue: #3987e5;
+      --aqua: #199e70;
+      --yellow: #c98500;
+      --violet: #9085e9;
+      --red: #e66767;
+      --good-bg: #14352a;
+      --bad-bg: #3d2020;
+      --warn-bg: #3a2f14;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--surface); color: var(--text-primary);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 24px; max-width: 1080px; margin: 0 auto;
+  }
+  h1 { font-size: 22px; }
+  h1 small { color: var(--text-secondary); font-weight: 400; font-size: 14px; }
+  header p { color: var(--text-secondary); margin-top: 4px; max-width: 72ch; }
+  header a { color: var(--blue); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 20px 0; }
+  .tile {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; border-top: 3px solid var(--accent, var(--border));
+  }
+  .tile .label { font-size: 12px; color: var(--text-secondary); }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .value .unit { font-size: 12px; color: var(--text-muted); font-weight: 400; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .card h2 { font-size: 16px; }
+  .card p { color: var(--text-secondary); font-size: 13px; }
+  .card button {
+    align-self: flex-start; cursor: pointer; border: 0; border-radius: 6px;
+    background: var(--blue); color: #fff; font: 600 14px/1 inherit; padding: 10px 16px;
+  }
+  .card button:disabled { opacity: .45; cursor: wait; }
+  .out {
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; white-space: pre-wrap; min-height: 34px; color: var(--text-secondary);
+  }
+  .out strong { color: var(--text-primary); }
+  code {
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px;
+  }
+  .pill { display: inline-block; border-radius: 999px; padding: 1px 9px; font-size: 12px; font-weight: 600; }
+  .pill.good { background: var(--good-bg); color: var(--aqua); }
+  .pill.bad  { background: var(--bad-bg);  color: var(--red); }
+  .pill.warn { background: var(--warn-bg); color: var(--yellow); }
+  footer { margin-top: 22px; color: var(--text-muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AegisRoute <small>demo console — poke the control plane, watch it react</small></h1>
+  <p>
+    Buttons below fire real traffic at the gateway through this page's nginx proxy.
+    Watch the live numbers here, or open the
+    <a href="http://localhost:3000" target="_blank" rel="noopener">Grafana dashboard</a>
+    side by side for the full picture.
+  </p>
+</header>
+
+<div class="tiles">
+  <div class="tile" style="--accent:var(--blue)"><div class="label">Requests / s</div><div class="value" id="t-rps">—</div></div>
+  <div class="tile" style="--accent:var(--aqua)"><div class="label">Cache hit ratio (5m)</div><div class="value" id="t-hit">—</div></div>
+  <div class="tile" style="--accent:var(--yellow)"><div class="label">Rate-limited / s</div><div class="value" id="t-rl">—</div></div>
+  <div class="tile" style="--accent:var(--violet)"><div class="label">Batch items / s</div><div class="value" id="t-batch">—</div></div>
+  <div class="tile" style="--accent:var(--blue)"><div class="label">breaker: mock-llm-fast</div><div class="value" id="t-cb-fast">—</div></div>
+  <div class="tile" style="--accent:var(--aqua)"><div class="label">breaker: mock-llm-cheap</div><div class="value" id="t-cb-cheap">—</div></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Cache storm</h2>
+    <p>100 identical cache-eligible requests, 20 at a time. The first wave misses and
+       pays ~40ms of (simulated) inference; the rest are served from Redis in ~1ms.</p>
+    <button id="b-storm">Fire 100 requests</button>
+    <div class="out" id="o-storm">idle</div>
+  </div>
+
+  <div class="card">
+    <h2>Idempotency replay</h2>
+    <p>Eight requests race in with the <em>same</em> fresh <code>Idempotency-Key</code> —
+       one executes, the rest get 409. Then twelve replays of the completed key return
+       the stored response with <strong>zero</strong> new backend calls.</p>
+    <button id="b-idem">Race one key</button>
+    <div class="out" id="o-idem">idle</div>
+  </div>
+
+  <div class="card">
+    <h2>Batch flood</h2>
+    <p>Submits one async job with 100 items. The gateway writes job + items + outbox in
+       one transaction and publishes to a Redis Stream; a separate worker process drains
+       it on a bounded pool. Polls the job to a terminal status.</p>
+    <button id="b-batch">Submit 100-item job</button>
+    <div class="out" id="o-batch">idle</div>
+  </div>
+
+  <div class="card">
+    <h2>Live traffic <span class="pill warn" id="p-live" hidden>running</span></h2>
+    <p>A steady ~4 req/s of uncacheable traffic. Turn it on, then kill the primary backend
+       in a terminal — <code>docker compose stop mock-llm-fast</code> — and watch the
+       breaker tiles flip while requests keep succeeding via failover.
+       (<code>docker compose start mock-llm-fast</code> to recover.)</p>
+    <button id="b-live">Start</button>
+    <div class="out" id="o-live">idle</div>
+  </div>
+
+  <div class="card">
+    <h2>Backend outage (CLI)</h2>
+    <p>The full scripted version — stops the container, drives 150 requests, shows the
+       breaker open, then restarts it and shows recovery. A browser can't stop containers,
+       so this one runs in a terminal:</p>
+    <div class="out">bash scripts/demo.sh backend-outage</div>
+  </div>
+
+  <div class="card">
+    <h2>Rate-limit burst (CLI)</h2>
+    <p>Recreates the gateway with a 10 QPS per-key window, fires 50 rapid requests, counts
+       the 429s, restores the default. Also terminal-only (it recreates a compose service):</p>
+    <div class="out">bash scripts/demo.sh rate-limit-burst</div>
+  </div>
+</div>
+
+<footer>
+  Local demo credentials only (<code>sg_dev_key_123</code> — seeded, never used outside this stack).
+  Gateway <a href="http://localhost:8080/healthz" target="_blank" rel="noopener" style="color:var(--blue)">:8080</a> ·
+  Grafana <a href="http://localhost:3000" target="_blank" rel="noopener" style="color:var(--blue)">:3000</a> ·
+  Prometheus <a href="http://localhost:9090" target="_blank" rel="noopener" style="color:var(--blue)">:9090</a>
+</footer>
+
+<script>
+"use strict";
+const KEY = "sg_dev_key_123";
+const HDRS = { "Authorization": "Bearer " + KEY, "Content-Type": "application/json" };
+const $ = (id) => document.getElementById(id);
+
+// ---- helpers ---------------------------------------------------------------
+
+async function promQ(query) {
+  const r = await fetch("/prom/api/v1/query?query=" + encodeURIComponent(query));
+  const j = await r.json();
+  return (j.data && j.data.result) || [];
+}
+
+// Exact counter sums straight from the gateway's /metrics (no scrape lag).
+async function metricSum(prefix) {
+  const text = await (await fetch("/gateway/metrics")).text();
+  let s = 0;
+  for (const line of text.split("\n")) {
+    if (line.startsWith(prefix)) s += Number(line.slice(line.lastIndexOf(" ")));
+  }
+  return s;
+}
+
+function chat(body, extraHeaders) {
+  return fetch("/gateway/v1/chat/completions", {
+    method: "POST",
+    headers: Object.assign({}, HDRS, extraHeaders || {}),
+    body: JSON.stringify(body),
+  });
+}
+
+// Run fn() n times with a fixed-size worker pool; returns per-call results.
+async function pool(n, size, fn) {
+  const results = new Array(n);
+  let next = 0;
+  async function worker() {
+    while (next < n) {
+      const i = next++;
+      try { results[i] = await fn(i); } catch (e) { results[i] = { error: String(e) }; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(size, n) }, worker));
+  return results;
+}
+
+function tally(codes) {
+  const m = new Map();
+  for (const c of codes) m.set(c, (m.get(c) || 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${n}x ${c}`).join(", ");
+}
+
+async function withButton(btn, out, fn) {
+  btn.disabled = true;
+  try { await fn(); }
+  catch (e) { out.textContent = "failed: " + e; }
+  finally { btn.disabled = false; }
+}
+
+// ---- live tiles ------------------------------------------------------------
+
+const CB_TEXT = { 0: ["CLOSED", "good"], 1: ["HALF-OPEN", "warn"], 2: ["OPEN", "bad"] };
+
+async function refreshTiles() {
+  try {
+    const [rps, hit, rl, batch, cb] = await Promise.all([
+      promQ("sum(rate(aegisroute_http_requests_total[1m]))"),
+      promQ('sum(rate(aegisroute_cache_events_total{result="hit"}[5m])) / clamp_min(sum(rate(aegisroute_cache_events_total{result=~"hit|miss"}[5m])), 1e-9)'),
+      promQ("sum(rate(aegisroute_rate_limited_total[1m]))"),
+      promQ("sum(rate(aegisroute_batch_items_processed_total[1m]))"),
+      promQ("max by (backend) (aegisroute_circuit_breaker_state)"),
+    ]);
+    const val = (rs) => rs.length ? Number(rs[0].value[1]) : 0;
+    $("t-rps").textContent = val(rps).toFixed(1);
+    $("t-hit").textContent = hit.length ? (val(hit) * 100).toFixed(0) + "%" : "—";
+    $("t-rl").textContent = val(rl).toFixed(1);
+    $("t-batch").textContent = val(batch).toFixed(1);
+    for (const r of cb) {
+      const el = r.metric.backend === "mock-llm-fast" ? $("t-cb-fast")
+               : r.metric.backend === "mock-llm-cheap" ? $("t-cb-cheap") : null;
+      if (!el) continue;
+      const [txt, cls] = CB_TEXT[Number(r.value[1])] || ["?", "warn"];
+      el.innerHTML = `<span class="pill ${cls}">${txt}</span>`;
+    }
+  } catch { /* stack still starting; try again on the next tick */ }
+}
+refreshTiles();
+setInterval(refreshTiles, 3000);
+
+// ---- scenarios -------------------------------------------------------------
+
+const STORM_BODY = {
+  model: "llama-fast",
+  messages: [{ role: "user", content: "What does an LLM gateway do?" }],
+  temperature: 0, max_tokens: 64,
+};
+
+$("b-storm").onclick = () => withButton($("b-storm"), $("o-storm"), async () => {
+  const out = $("o-storm");
+  out.textContent = "firing 100 requests (20-way concurrent)...";
+  const t0 = performance.now();
+  const rs = await pool(100, 20, async () => {
+    const r = await chat(STORM_BODY);
+    return { code: r.status, cache: r.headers.get("x-aegisroute-cache") || "-" };
+  });
+  const dt = ((performance.now() - t0) / 1000).toFixed(1);
+  const hits = rs.filter((r) => r.cache === "HIT").length;
+  const misses = rs.filter((r) => r.cache === "MISS").length;
+  const tHit0 = performance.now();
+  await chat(STORM_BODY);
+  const hitMs = (performance.now() - tHit0).toFixed(0);
+  out.innerHTML = `done in ${dt}s — ${tally(rs.map((r) => r.code))}\n` +
+    `cache: <strong>${hits} HIT / ${misses} MISS</strong>\n` +
+    `one more warm request just took <strong>${hitMs}ms</strong> end to end (browser-measured)`;
+});
+
+$("b-idem").onclick = () => withButton($("b-idem"), $("o-idem"), async () => {
+  const out = $("o-idem");
+  const key = "console-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
+  const body = {
+    model: "llama-fast",
+    messages: [{ role: "user", content: "Charge my card exactly once." }],
+    temperature: 0.9, max_tokens: 64,
+  };
+  out.textContent = "phase 1: 8 concurrent requests, one fresh key...";
+  const race = await pool(8, 8, async () => (await chat(body, { "Idempotency-Key": key })).status);
+  out.textContent = "phase 2: 12 replays of the completed key...";
+  const before = await metricSum("aegisroute_backend_requests_total");
+  const replays = await pool(12, 12, async () => (await chat(body, { "Idempotency-Key": key })).status);
+  const after = await metricSum("aegisroute_backend_requests_total");
+  out.innerHTML = `phase 1 (race): ${tally(race)} — one winner, rest 409 in-progress\n` +
+    `phase 2 (replay): ${tally(replays)}\n` +
+    `backend calls during replays: <strong>+${after - before}</strong> (the ledger answered, not a model)`;
+});
+
+$("b-batch").onclick = () => withButton($("b-batch"), $("o-batch"), async () => {
+  const out = $("o-batch");
+  out.textContent = "submitting a 100-item job...";
+  const requests = Array.from({ length: 100 }, (_, i) => ({
+    custom_id: "console-item-" + i,
+    body: {
+      model: "llama-fast",
+      messages: [{ role: "user", content: "batch item " + i }],
+      temperature: 0.9, max_tokens: 32,
+    },
+  }));
+  const t0 = performance.now();
+  const created = await fetch("/gateway/api/v1/batch-jobs", {
+    method: "POST", headers: HDRS, body: JSON.stringify({ requests }),
+  });
+  if (!created.ok) { out.textContent = "create failed: HTTP " + created.status; return; }
+  const job = await created.json();
+  out.textContent = `job ${job.id} queued; polling...`;
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const j = await (await fetch("/gateway/api/v1/batch-jobs/" + job.id, { headers: HDRS })).json();
+    if (["succeeded", "partially_failed", "failed"].includes(j.status)) {
+      const dt = ((performance.now() - t0) / 1000).toFixed(1);
+      out.innerHTML = `job <strong>${j.status}</strong> — 100 items in ${dt}s ` +
+        `(~${Math.round(100 * 60 / dt)} items/min through the Redis Streams worker)`;
+      return;
+    }
+    out.textContent = `job ${job.id}: ${j.status} (${i + 1}s)`;
+  }
+  out.textContent = "job not terminal after 60s — check the worker logs";
+});
+
+let liveTimer = null;
+$("b-live").onclick = () => {
+  const out = $("o-live"), btn = $("b-live"), pill = $("p-live");
+  if (liveTimer) {
+    clearInterval(liveTimer); liveTimer = null;
+    btn.textContent = "Start"; pill.hidden = true; out.textContent = "stopped";
+    return;
+  }
+  let sent = 0, okN = 0, errN = 0;
+  liveTimer = setInterval(async () => {
+    for (let i = 0; i < 4; i++) {
+      sent++;
+      chat({
+        model: "llama-fast",
+        messages: [{ role: "user", content: "live " + sent }],
+        temperature: 0.9, max_tokens: 16,
+      }).then((r) => { r.ok ? okN++ : errN++; })
+        .catch(() => { errN++; })
+        .finally(() => { out.textContent = `sent ${sent} — ${okN} ok, ${errN} failed`; });
+    }
+  }, 1000);
+  btn.textContent = "Stop"; pill.hidden = false; out.textContent = "driving ~4 req/s...";
+};
+</script>
+</body>
+</html>
