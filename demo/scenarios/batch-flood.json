@@ -1,0 +1,9 @@
+{
+  "name": "batch-flood",
+  "title": "Batch flood - 200 async items through the Redis Streams worker",
+  "type": "batch",
+  "items": 200,
+  "chunk": 100,
+  "narrative": "Submits 200 chat requests as async batch jobs (the API caps a batch at 100 items, so this is two jobs). Each create is one transaction (job + items + outbox row) and one Redis Streams publish; the control-worker claims items with FOR UPDATE SKIP LOCKED and processes them on its bounded pool (WORKER_CONCURRENCY=8) against the same backends. The driver polls both jobs to a terminal status and reports wall-clock throughput.",
+  "watch": "Grafana: 'Batch processing' and the 'Batch items / s' stat; the worker is a separate process - this traffic never touches the gateway's chat handler."
+}

@@ -133,3 +133,27 @@ The full precedence order and its rationale live in `docs/design-decisions.md`
 ## Demo credentials (LOCAL-ONLY)
 
 - API key `sg_dev_key_123` (stored only as its HMAC), admin token `dev_admin_token` — marked LOCAL-ONLY in `.env.example` and never valid anywhere but a local dev stack.
+
+## Interactive demo (Stage 9, post-MVP)
+
+- **The three-binary rule survives the demo layer.** Grafana and the demo
+  console are external images (`grafana/grafana:11.5.1`, `nginx:1.27-alpine`)
+  in the demo compose overlay, exactly as Prometheus already was. The scenario
+  driver is `scripts/demo.sh` (curl+jq, `xargs -P` for concurrency) — no
+  `cmd/` load generator, same reasoning as `scripts/bench.sh` choosing `hey`.
+- **Demo knobs live in `docker-compose.demo.yml`, never the base file** —
+  same pattern as the bench overlay. ~40ms mock latency makes cache/failover
+  visible; `RATE_LIMIT_QPS` defaults to 1000 there (env-substitutable as
+  `DEMO_RATE_LIMIT_QPS`) so burst scenarios exercise the mechanism under test;
+  the rate-limit scenario recreates just `gateway-api` with a low limit and
+  restores it, the proven bench.sh technique.
+- **The console proxies instead of the gateway growing CORS.** nginx serves
+  the static page and reverse-proxies `/gateway/` and `/prom/` so the browser
+  stays same-origin. Adding CORS headers to the gateway for a demo page would
+  be demo-driven API surface; rejected.
+- **Scenario reports read `/metrics` directly, not Prometheus**, so deltas are
+  exact and instant (no scrape-interval race). Grafana/Prometheus are for the
+  human watching trends, the driver is for proving counts.
+- **Grafana is anonymous read-only** (`GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer`),
+  file-provisioned with a fixed datasource uid (`aegisroute-prom`) that the
+  dashboard JSON references; a login wall in a local demo serves nobody.

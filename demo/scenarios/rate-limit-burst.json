@@ -1,0 +1,16 @@
+{
+  "name": "rate-limit-burst",
+  "title": "Rate limit - 50 requests into a 10 QPS per-key window",
+  "type": "ratelimit",
+  "qps": 10,
+  "total": 50,
+  "concurrency": 25,
+  "body": {
+    "model": "llama-fast",
+    "messages": [{ "role": "user", "content": "rate limit burst" }],
+    "temperature": 0.9,
+    "max_tokens": 16
+  },
+  "narrative": "The demo stack runs with the limiter effectively off (RATE_LIMIT_QPS=1000) so other scenarios can burst freely, so this one briefly recreates gateway-api with RATE_LIMIT_QPS=10, fires 50 rapid requests against the fixed per-key window, counts the 429s, then restores the demo default. Requires docker (it recreates one compose service).",
+  "watch": "Grafana: the 'Rate-limited / s' stat and the 429 series in 'HTTP requests by status'."
+}

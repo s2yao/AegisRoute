@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning: load every JSON dashboard mounted under
+# /var/lib/grafana/dashboards (see docker-compose.demo.yml volumes).
+apiVersion: 1
+
+providers:
+  - name: aegisroute
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

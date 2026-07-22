@@ -60,9 +60,58 @@ flowchart LR
 6. **Batch jobs + Redis Streams + control-worker** — ✅ **DONE** (committed on branch)
 7. **Docker/Compose/Prometheus/E2E/README/docs/CI** — ✅ **DONE** (implemented; **uncommitted** — see "Current state")
 
-**PROJECT PHASE: COMPLETE.** All 7 stages implemented. A post-MVP **Stage 8**
-(observability patches + load benchmark) is also done. Only `docs/future-work.md`
-items remain intentionally unbuilt.
+**PROJECT PHASE: COMPLETE.** All 7 stages implemented. Post-MVP **Stage 8**
+(observability patches + load benchmark) and **Stage 9** (interactive demo:
+Grafana, scenario driver, browser console, README GIF) are also done. Only
+`docs/future-work.md` items remain intentionally unbuilt.
+
+## Stage 9 — interactive demo (2026-07-14, post-MVP, uncommitted)
+
+Recruiter/reviewer-facing interactive layer. **No Go source changed** (gate
+still green); still exactly three binaries — Grafana and nginx are external
+images, like Prometheus. All artifacts verified live (see below).
+
+- **`docker-compose.demo.yml`** overlay (mirrors the bench-overlay pattern):
+  ~40ms mock latency, `RATE_LIMIT_QPS=${DEMO_RATE_LIMIT_QPS:-1000}`, plus two
+  new services — `grafana` (`grafana/grafana:11.5.1`, :3000, anonymous Viewer,
+  file-provisioned) and `demo-console` (`nginx:1.27-alpine`, :8000, serves the
+  static console and reverse-proxies gateway+Prometheus so the browser stays
+  same-origin; the gateway stays CORS-free).
+- **Grafana provisioning** — `observability/grafana/provisioning/{datasources,
+  dashboards}` + `observability/grafana/dashboards/aegisroute.json` (13 panels
+  over the 15-metric set: stat row with breaker-state value mappings, HTTP/
+  latency-by-cache/backend/breaker/cache/batch/in-flight timeseries; datasource
+  uid `aegisroute-prom` is referenced by every panel).
+- **Scenario files** `demo/scenarios/*.json` (declarative: type, counts,
+  concurrency, body, narrative) + **`scripts/demo.sh`** driver (menu / `list` /
+  `<name>`; curl+jq only — no hey; `xargs -P` concurrency; exact metric deltas
+  read from `/metrics`, not Prometheus, to avoid scrape lag; curl `%header{}`
+  feature-detect). Scenarios: `cache-storm`, `idempotency-replay` (races one
+  key: 1×200 + 9×409, then replays with backend delta +0), `rate-limit-burst`
+  (recreates gateway with `DEMO_RATE_LIMIT_QPS=10`, restores after),
+  `backend-outage` (stops the container, drives traffic, shows breaker
+  open→failover→recovery), `batch-flood` (2×100 items).
+- **`demo/console/`** — static `index.html` (vanilla JS: live stat tiles
+  polling PromQL every 3s incl. per-backend breaker state, buttons for the
+  browser-runnable scenarios, a live-traffic toggle for the kill-a-backend
+  party trick) + `nginx.conf`.
+- **Makefile**: `demo` (demo-up + menu), `demo-up`, `demo-down`, `demo-gif`.
+- **`scripts/demo.tape`** (vhs) → **`docs/assets/demo.gif`** (recorded live,
+  2.1 MB: cache-storm, idempotency, backend-outage). README got an
+  "Interactive demo" section embedding it; `docs/demo.md` is the full guide;
+  `docs/future-work.md` updated (Grafana shipped; hosted-public-demo noted).
+
+**Live verification (2026-07-14): PASSED.** Demo stack up (all 9 services);
+Grafana healthy with datasource uid + dashboard provisioned and queryable
+anonymously; console serves and both proxy paths work (chat 200 via
+`:8000/gateway/...`). All five scenarios run green end-to-end: cache-storm
+(MISS 78.3ms → HIT 1.1ms, 200/200 HIT after warm, backend +1);
+idempotency-replay (1×200 + 9×409 race, then 20 replays backend **+0**);
+rate-limit-burst (40/50 → 429 at QPS=10, counter +40, default restored);
+backend-outage (150/150 → 200 during a real container stop, fast +30 / cheap
++150, breaker state 2, short-circuits +140, recovery to state 0 after
+restart+cooldown); batch-flood (200 items succeeded in ~2s, worker +200).
+`make verify` green before and after (no Go changes).
 
 ## Stage 8 — observability + benchmark (2026-07-08, post-MVP, uncommitted)
 

@@ -97,3 +97,13 @@ starts.
 - [x] `scripts/bench.sh` (`make bench`): hey profiles (uncached BYPASS vs cached HIT), batch throughput (chunked ≤100/batch), Prometheus PromQL extraction, rate-limit demo, circuit-breaker demo; writes `docs/benchmarks.md`; bounded waits; cleanup trap
 - [x] `docs/benchmarks.md` (real numbers + environment caveats) and `docs/resume-bullets.md` (populated with measured numbers)
 - [x] Definition of Done: gofmt/vet/build/test clean (unchanged, Docker-free); `make bench` PASSED live — cache p95 5.8× / throughput 10.4×, ~6000 items/min batch, breaker 200/200 via failover, 45/50 rate-limited
+
+## Stage 9 — Interactive demo: Grafana, scenarios, console, GIF (DONE — post-MVP; uncommitted)
+
+- [x] `docker-compose.demo.yml` overlay: ~40ms mock latency, `DEMO_RATE_LIMIT_QPS` (default 1000), grafana (`grafana/grafana:11.5.1`, :3000, anonymous Viewer, provisioned) + demo-console (`nginx:1.27-alpine`, :8000, static page + same-origin reverse proxy to gateway/Prometheus) — still exactly three Go binaries
+- [x] Grafana provisioning: datasource (`aegisroute-prom` → prometheus:9090), file provider, `dashboards/aegisroute.json` (13 panels over all 15 metrics; breaker-state value mappings; fixed per-entity series colors)
+- [x] `demo/scenarios/*.json` (5 declarative scenarios) + `scripts/demo.sh` (menu/list/name; curl+jq only; xargs -P bursts; exact `/metrics` deltas; recreates gateway for the rate-limit phase; stops/starts mock-llm-fast for the outage phase)
+- [x] `demo/console/index.html` + `nginx.conf`: live stat tiles (PromQL poll), cache-storm/idempotency-race/batch buttons, live-traffic toggle for the manual kill-a-backend demo
+- [x] Makefile: `demo`, `demo-up`, `demo-down`, `demo-gif`
+- [x] `scripts/demo.tape` (vhs) → `docs/assets/demo.gif` recorded against the live stack; README "Interactive demo" section + `docs/demo.md`; `docs/future-work.md` updated (Grafana shipped, hosted-demo note)
+- [x] Definition of Done: `make verify` green (no Go changes); live run — all 5 scenarios PASSED (cache 78.3ms→1.1ms; idempotency 9×409 + replay backend +0; 40/50 429s; outage 150/150 200s + breaker 2→0; batch 200 items ~2s); Grafana + console verified over HTTP

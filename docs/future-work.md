@@ -55,8 +55,17 @@ for the MVP.
 
 ## Load & dashboards
 
-- **k6** load-test scripts for the sync and batch paths.
-- **Grafana** dashboards over the existing Prometheus metrics.
+- **k6** load-test scripts for the sync and batch paths. (`make bench` covers
+  single-machine load with `hey`, and `make demo` ships scripted traffic
+  scenarios — k6 would add scriptable, assertable load profiles.)
+- ~~Grafana dashboards~~ — **shipped** post-MVP: the demo stack provisions a
+  Grafana dashboard over the full metric set (see `docs/demo.md`).
 
 These would validate and visualize behavior under load but add no new
 control-plane capability.
+
+## Hosted public demo
+
+The interactive demo (`docs/demo.md`) runs locally. Hosting a throwaway public
+instance (small VM, reverse proxy + TLS, low `DEMO_RATE_LIMIT_QPS`, nightly
+state reset) needs no repo changes — it is an ops task, deliberately left out.

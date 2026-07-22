@@ -1,0 +1,15 @@
+{
+  "name": "cache-storm",
+  "title": "Cache storm - 200 identical requests, 40-way concurrent",
+  "type": "chat_burst",
+  "total": 200,
+  "concurrency": 40,
+  "body": {
+    "model": "llama-fast",
+    "messages": [{ "role": "user", "content": "What does an LLM gateway do?" }],
+    "temperature": 0,
+    "max_tokens": 64
+  },
+  "narrative": "Every request is identical and cache-eligible (temperature 0, no streaming). The first wave misses and reaches a backend (~40ms simulated inference); everything after is served straight from Redis in about a millisecond. The driver times one MISS and one HIT so the speedup is a number, not a claim.",
+  "watch": "Grafana: 'Cache lookups by result', 'Chat completion p95 by cache outcome', and the hit-ratio stat."
+}

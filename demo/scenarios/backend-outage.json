@@ -1,0 +1,17 @@
+{
+  "name": "backend-outage",
+  "title": "Backend outage - kill the primary, watch the breaker open and traffic fail over",
+  "type": "outage",
+  "stop_service": "mock-llm-fast",
+  "total": 150,
+  "concurrency": 10,
+  "recovery_probes": 10,
+  "body": {
+    "model": "llama-fast",
+    "messages": [{ "role": "user", "content": "who serves this request?" }],
+    "temperature": 0.9,
+    "max_tokens": 32
+  },
+  "narrative": "The driver stops the mock-llm-fast container (a real outage: connection refused), then drives 150 requests. The first few failures trip the circuit breaker (CB_FAILURE_THRESHOLD=5), after which the selector short-circuits the dead backend and every request is served by mock-llm-cheap via intra-request failover - clients keep getting 200s. The driver then restarts the backend, waits out the breaker cooldown (10s), and sends probe traffic to show the breaker close again. Requires docker.",
+  "watch": "Grafana: 'Backend requests by backend and outcome' (traffic shifts fast -> cheap), 'Breaker state over time', 'Retries and short-circuits', and the breaker stat flipping CLOSED -> OPEN -> CLOSED."
+}

@@ -10,7 +10,8 @@ SHELL := /bin/sh
 .DEFAULT_GOAL := help
 
 .PHONY: help fmt vet test verify test-integration migrate-up seed-dev \
-	dev-up dev-down logs verify-e2e bench clean
+	dev-up dev-down logs verify-e2e bench clean \
+	demo demo-up demo-down demo-gif
 
 help: ## List all targets with descriptions
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -56,6 +57,18 @@ verify-e2e: ## Full end-to-end verification against a fresh compose stack
 
 bench: ## Load benchmark: bench stack, hey profiles, PromQL, writes docs/benchmarks.md
 	bash scripts/bench.sh
+
+demo-up: ## Start the interactive demo stack (base + demo overlay: Grafana, console)
+	docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+
+demo: demo-up ## Demo stack up, then the interactive scenario menu (scripts/demo.sh)
+	bash scripts/demo.sh
+
+demo-down: ## Stop the demo stack and remove its volumes/orphans
+	docker compose -f docker-compose.yml -f docker-compose.demo.yml down -v --remove-orphans
+
+demo-gif: ## Re-record docs/assets/demo.gif with vhs (demo stack must be up)
+	vhs scripts/demo.tape
 
 clean: ## Remove build/test/coverage artifacts (never source)
 	go clean ./...
